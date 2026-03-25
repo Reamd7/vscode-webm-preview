@@ -211,7 +211,67 @@ async function handleBrainstorming(
   const plan = parseJson(result.output);
 
   if (plan && Array.isArray(plan.tasks) && plan.tasks.length > 0) {
-    // 将 subagent 返回的任务列表写入 task.json
+    // ---- Plan 审查循环 ----
+    // 借鉴 superpowers/writing-plans 的 plan-document-reviewer：
+    // 生成计划后必须经过审查，确保粒度、覆盖性、TDD 节奏等。
+    const planReviewPrompt = await loadPrompt(piDir, "review-plan", {
+      goal: taskFile.goal,
+      spec,
+      planJson: JSON.stringify(plan.tasks, null, 2),
+    });
+
+    const planReviewResult = await runSubagent(planReviewPrompt, ctx.cwd, { tools: ["read"] });
+    const planReview = parseJson(planReviewResult.output);
+
+    if (
+      planReview &&
+      planReview.approved === false &&
+      Array.isArray(planReview.issues) &&
+      planReview.issues.length > 0
+    ) {
+      // 计划审查不通过 → 用审查意见重新生成
+      // 保持 planning 状态，附带审查反馈让 subagent 重新生成
+      const issueList = planReview.issues
+        .map(
+          (i: { taskIndex: number; issue: string; suggestion: string }) =>
+            `- 任务 ${i.taskIndex + 1}: ${i.issue}（建议：${i.suggestion}）`,
+        )
+        .join("\n");
+
+      const retryPrompt = await loadPrompt(piDir, "plan", {
+        goal: taskFile.goal,
+        spec,
+        context: `${context}\n\n## 上一版计划的审查意见（请根据意见修改）\n\n${issueList}`,
+      });
+
+      const retryResult = await runSubagent(retryPrompt, ctx.cwd, { tools: ["read", "bash"] });
+      const retryPlan = parseJson(retryResult.output);
+
+      if (retryPlan && Array.isArray(retryPlan.tasks) && retryPlan.tasks.length > 0) {
+        // 用修订后的计划
+        const planned: TaskFile = {
+          ...updated,
+          status: "executing",
+          tasks: retryPlan.tasks.map((t: { title: string }, i: number) => ({
+            id: String(i + 1).padStart(3, "0"),
+            title: t.title,
+            status: "pending" as const,
+            summary: null,
+          })),
+          currentTaskId: "001",
+        };
+        await writeTaskFile(piDir, planned);
+        pi.sendUserMessage(
+          `任务计划已审查修订，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`,
+          { deliverAs: "followUp" },
+        );
+      } else {
+        pi.sendUserMessage("任务计划修订失败，请重新生成。", { deliverAs: "followUp" });
+      }
+      return;
+    }
+
+    // ---- Plan 审查通过，写入 task.json ----
     const planned: TaskFile = {
       ...updated,
       status: "executing",
@@ -221,15 +281,17 @@ async function handleBrainstorming(
         status: "pending" as const,
         summary: null,
       })),
-      currentTaskId: "001", // 从第一个任务开始
+      currentTaskId: "001",
     };
     await writeTaskFile(piDir, planned);
 
-    pi.sendUserMessage(`任务计划已生成，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`, {
-      deliverAs: "followUp",
-    });
+    pi.sendUserMessage(
+      `任务计划已生成并通过审查，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`,
+      {
+        deliverAs: "followUp",
+      },
+    );
   } else {
-    // subagent 输出格式不对，重试
     pi.sendUserMessage("任务计划生成失败，请重新生成。", { deliverAs: "followUp" });
   }
 }
@@ -824,10 +886,26 @@ async function handleFinalValidation(
   const validation = parseJson(result.output);
 
   if (validation?.passed === true) {
-    // ---- 验收通过 → 项目完成 ----
+    // ---- 验收通过 → 进入收尾流程 ----
+    // 借鉴 superpowers/finishing-a-development-branch：
+    // 验收通过后执行收尾（提交变更、验证、生成总结）
     const completed: TaskFile = { ...taskFile, status: "completed" };
     await writeTaskFile(piDir, completed);
-    sendMessage(pi, ctx, `## 验收通过 ✅\n\n${validation.reason || "所有任务已满足 spec。"}`);
+
+    const completedSummaries = buildCompletedSummaries(completed);
+    const finishGitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
+
+    const finishPrompt = await loadPrompt(piDir, "finish", {
+      goal: completed.goal,
+      completedSummaries,
+      gitStatus: finishGitStatus.stdout || "(clean)",
+    });
+
+    sendMessage(
+      pi,
+      ctx,
+      `## 验收通过 ✅\n\n${validation.reason || "所有任务已满足 spec。"}\n\n---\n\n${finishPrompt}`,
+    );
     return;
   }
 
