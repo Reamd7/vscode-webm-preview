@@ -3,11 +3,18 @@
 *.local
 *.log*
 
+# Pi agent loop (user-specific)
+.pi/agent-loop.txt
+
 # Dist
 node_modules
 dist/
 storybook-static
 doc_build/
+
+# Pi extensions build artifacts
+.pi/node_modules/
+.pi/dist/
 
 # IDE
 .vscode/*
