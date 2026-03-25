@@ -1,7 +1,7 @@
 import { expect, test } from "@rstest/core";
-import { squared } from "../src/index";
+import { add } from "../src/math";
 
-test("squared", () => {
-  expect(squared(2)).toBe(4);
-  expect(squared(12)).toBe(144);
+test("add", () => {
+  expect(add(2, 2)).toBe(4);
+  expect(add(12, 12)).toBe(24);
 });

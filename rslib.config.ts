@@ -5,6 +5,7 @@ export default defineConfig(() => {
     source: {
       entry: {
         extension: "./src/extension.ts",
+        "test/e2e/index": "./src/test/e2e/index.ts",
       },
     },
     lib: [
@@ -22,6 +23,7 @@ export default defineConfig(() => {
           sourceMap: {
             js: "source-map",
           },
+          externals: ["vscode"],
         },
       },
     ],
