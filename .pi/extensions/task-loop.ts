@@ -1,37 +1,24 @@
 /**
  * task-loop.ts — 核心 Extension：状态驱动的自循环任务系统
  *
- * 这是整个任务系统的"大脑"。它不自己做任何推理工作，
- * 而是根据 task.json 中的当前状态，决定：
- * - 注入什么 prompt 给主 agent（用于需要用户交互或完整工具链的场景）
- * - 派发什么 subagent（用于隔离的、输入输出明确的场景）
- * - 执行什么硬编码检查（lint / typecheck / test）
+ * 核心不变量：
+ * **每个异步操作（subagent / 硬编码检查）执行前，必须先写入一个"正在进行"的状态。**
+ * **dispatch 遇到"正在进行"状态时，什么都不做（等操作完成后再推进）。**
  *
- * ┌─────────────────── 触发机制 ───────────────────┐
- * │                                                 │
- * │  pi 的 agent_end 事件在每次 LLM 回合结束后触发  │
- * │  ↓                                              │
- * │  读取 task.json → 根据 status 决定下一步        │
- * │  ↓                                              │
- * │  注入 prompt / 派发 subagent / 执行检查          │
- * │  ↓                                              │
- * │  更新 task.json → 等待下一个 agent_end          │
- * │                                                 │
- * └─────────────────────────────────────────────────┘
+ * 这保证了：
+ * 1. agent_end 重入时不会重复派发 subagent
+ * 2. 中断恢复时可以从"正在进行"状态安全重试
+ * 3. 不需要内存中的 hash/flag 等 hack 来防循环
  *
- * 完整生命周期（对应 task-flow.MD 的设计）：
+ * 状态机总览：
  *
- * 1. agent-loop.txt 写入目标 → 创建 task.json (brainstorming)
- * 2. 主 agent 与用户头脑风暴 → 写入 .pi/task/spec.md
- * 3. subagent 生成任务计划 → task.json (executing)
- * 4. 对每个任务：
- *    a. pending  → subagent 生成任务 spec
- *    b. preparing → subagent 反思 15min/200k，太大则拆分（递归）
- *    c. ready   → 主 agent 实施任务（含 harness）
- *    d. in_progress → 有文件变更时进入 verifying
- *    e. verifying → 硬编码检查 + LLM 质量反思 → 失败回到 in_progress
- *    f. done    → subagent 生成报告 → 间隙分析 → 下一个任务
- * 5. 所有任务完成 → subagent 最终验收 → 不通过则追加任务继续
+ * 项目级别：
+ *   brainstorming → reviewing_spec → planning → executing → validating → completed
+ *   (等待 spec)    (subagent 审查)   (生成计划)  (逐任务)    (最终验收)   (结束)
+ *
+ * 任务级别：
+ *   pending → preparing → reflecting → ready → in_progress → verifying → done
+ *   (空标题)  (生成 spec)  (反思规模)   (等实施)  (主 agent)    (检查+审查)  (报告)
  */
 
 import { join } from "node:path";
@@ -62,51 +49,55 @@ export default function taskLoop(pi: ExtensionAPI): void {
   /**
    * 追踪当前回合是否有文件变更。
    * 只有 in_progress 状态下有文件变更才会触发 verifying。
-   * 这避免了：agent 只是回答问题（没有写文件）就被误判为"完成了任务"。
    */
   let filesModified = false;
 
   /**
    * 追踪当前任务的修复循环次数。
-   * 借鉴 systematic-debugging：超过 2 次修复失败后，
-   * 注入系统化调试指导，阻止 agent 继续盲目尝试。
+   * 超过 2 次修复失败后注入系统化调试指导。
    */
   let fixAttempts = 0;
   let fixAttemptsTaskId: string | null = null;
 
-  // 监听所有 write/edit 工具调用，标记有文件变更
   pi.on("tool_call", (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       filesModified = true;
     }
   });
 
-  /**
-   * agent_end 是核心触发点 —— 每次 LLM 回合结束后都会触发。
-   *
-   * 这个 handler 就是整个状态机的 dispatch：
-   * 读取 task.json → 根据 status 路由到对应的 handler。
-   */
   pi.on("agent_end", async (_event, ctx) => {
     const piDir = join(ctx.cwd, ".pi");
     const taskFile = await readTaskFile(piDir);
 
-    // task.json 不存在 → 检查 agent-loop.txt 是否有新目标
     if (!taskFile) {
       await handleNoTaskFile(pi, piDir, ctx);
       return;
     }
 
-    // 根据项目级别状态分发
     switch (taskFile.status) {
       case "brainstorming":
         await handleBrainstorming(pi, piDir, taskFile, ctx);
         break;
-      case "planning":
-        await handlePlanning(pi, piDir, taskFile, ctx);
+
+      case "reviewing_spec":
+        // subagent 正在审查 spec，什么都不做，等审查完成后推进
         break;
+
+      case "planning":
+        // subagent 正在生成/审查计划，什么都不做
+        // 如果是中断恢复且 tasks 已有，推进到 executing
+        if (taskFile.tasks.length > 0) {
+          const updated: TaskFile = {
+            ...taskFile,
+            status: "executing",
+            currentTaskId: taskFile.currentTaskId || taskFile.tasks[0].id,
+          };
+          await writeTaskFile(piDir, updated);
+          pi.sendUserMessage("进入执行阶段。", { deliverAs: "followUp" });
+        }
+        break;
+
       case "executing": {
-        // 追踪修复循环次数：如果 currentTaskId 变了，重置计数
         const currentId = taskFile.currentTaskId;
         if (currentId !== fixAttemptsTaskId) {
           fixAttempts = 0;
@@ -118,24 +109,23 @@ export default function taskLoop(pi: ExtensionAPI): void {
         else if (result === "fix_passed") fixAttempts = 0;
         break;
       }
+
+      case "validating":
+        // subagent 正在做最终验收，什么都不做
+        break;
+
       case "completed":
-        // 项目已完成，不做任何事
         break;
     }
   });
 }
 
 // ===========================================================================
-// 项目级别阶段 handlers
+// 项目级别 handlers
 // ===========================================================================
 
 /**
- * 初始触发：检测 agent-loop.txt 是否有目标。
- *
- * 这是整个任务系统的入口点：
- * 1. 用户在 agent-loop.txt 中写入目标文本
- * 2. 本函数检测到后创建 task.json（status: brainstorming）
- * 3. 注入 brainstorm prompt，主 agent 开始与用户交互
+ * 初始触发：检测 agent-loop.txt → 创建 task.json (brainstorming)。
  */
 async function handleNoTaskFile(
   pi: ExtensionAPI,
@@ -143,35 +133,27 @@ async function handleNoTaskFile(
   ctx: ExtensionContext,
 ): Promise<void> {
   const goal = (await safeReadFile(join(piDir, "agent-loop.txt"))).trim();
-  if (!goal) return; // 没有目标，什么都不做
+  if (!goal) return;
 
-  // 创建 task.json，进入 brainstorming 阶段
   const taskFile = createTaskFile(goal);
   await writeTaskFile(piDir, taskFile);
 
-  // 加载 brainstorm prompt 模板，注入目标和 spec 存放路径
   const prompt = await loadPrompt(piDir, "brainstorm", {
     goal,
     specPath: join(piDir, "task", "spec.md"),
   });
 
-  // 发送给主 agent（需要与用户交互，所以是主 agent 而非 subagent）
   sendMessage(pi, ctx, prompt);
 }
 
 /**
- * 头脑风暴阶段：等待 spec.md 生成，然后进行 spec 审查循环。
+ * brainstorming：等待 spec.md → 转 reviewing_spec → 跑审查。
  *
- * 这个阶段主 agent 与用户交互，不断细化需求。
- * 每次 agent_end 都会检查 spec.md 是否已存在：
- * - 不存在 → 不做任何事，让用户继续交互
- * - 已存在 → subagent 审查 spec 质量
- *   - 审查通过 → 进入 planning，用 subagent 生成任务计划
- *   - 审查不通过 → 注入问题列表，让主 agent 修复 spec（循环）
- *
- * 借鉴自 superpowers/brainstorming 的 spec 审查循环：
- * 写完 spec 后派发 reviewer subagent 检查完整性、一致性、YAGNI，
- * 确保 spec 质量足够高再进入 planning。
+ * 关键：先写 reviewing_spec 再跑 subagent。
+ * 这样下一个 agent_end 读到 reviewing_spec 就会跳过（noop）。
+ * 审查完成后根据结果：
+ * - 不通过 → 回到 brainstorming（等主 agent 修改 spec）
+ * - 通过 → 转 planning → 跑计划生成
  */
 async function handleBrainstorming(
   pi: ExtensionAPI,
@@ -183,9 +165,19 @@ async function handleBrainstorming(
   const spec = (await safeReadFile(specPath)).trim();
   if (!spec) return; // spec 还没写完，继续等
 
-  // ---- Spec 审查循环 ----
-  // 借鉴 superpowers/brainstorming 的 spec-document-reviewer：
-  // 写完 spec 后必须先审查，通过才能进入 planning。
+  // ---- 防止对同一份 spec 重复审查 ----
+  // 场景：审查不通过 → brainstorming → agent 回应但没改 spec → agent_end → 又审查
+  // 用 spec 内容的哈希避免：只有 spec 实际变化后才重新审查。
+  // 注意：这不是替代状态机的 hack，而是对"brainstorming 状态下 spec 已存在"
+  // 这个特定边界条件的幂等保护。状态机保证不会重入 reviewing_spec，
+  // 但无法区分"spec 没变的 brainstorming"和"spec 改了的 brainstorming"。
+  const { createHash } = await import("node:crypto");
+  const specHash = createHash("sha256").update(spec).digest("hex");
+  if (taskFile._lastReviewedSpecHash === specHash) return;
+
+  // ---- 先写状态，再跑 subagent ----
+  await writeTaskFile(piDir, { ...taskFile, status: "reviewing_spec" });
+
   const reviewPrompt = await loadPrompt(piDir, "review-spec", {
     specContent: spec,
   });
@@ -198,7 +190,13 @@ async function handleBrainstorming(
     Array.isArray(review.issues) &&
     review.issues.length > 0
   ) {
-    // spec 审查不通过 → 让主 agent 修复
+    // 审查不通过 → 回到 brainstorming，记录已审查的 spec hash 防重复
+    await writeTaskFile(piDir, {
+      ...taskFile,
+      status: "brainstorming",
+      _lastReviewedSpecHash: specHash,
+    });
+
     const issueList = review.issues
       .map(
         (i: { section: string; issue: string; reason: string }) =>
@@ -208,16 +206,33 @@ async function handleBrainstorming(
     pi.sendUserMessage(`Spec 审查未通过，请修改 \`${specPath}\` 后继续：\n\n${issueList}`, {
       deliverAs: "followUp",
     });
-    return; // 保持 brainstorming 状态，下一轮再检查
+    return;
   }
 
-  // ---- spec 审查通过，进入 planning ----
+  // ---- spec 审查通过 → planning → 生成计划 ----
+  await writeTaskFile(piDir, { ...taskFile, status: "planning" });
 
-  const updated: TaskFile = { ...taskFile, status: "planning" };
-  await writeTaskFile(piDir, updated);
+  await generateAndReviewPlan(pi, piDir, taskFile, spec, ctx);
+}
 
-  // 用 subagent 生成任务计划（隔离上下文，避免污染主对话）
+/**
+ * 生成任务计划 + 审查。在 planning 状态下运行。
+ *
+ * 这是一个同步流程（不会被 agent_end 重入，因为状态已经是 planning）：
+ * 1. subagent 生成计划
+ * 2. subagent 审查计划
+ * 3. 不通过 → 带反馈重新生成一次（最多一次重试）
+ * 4. 写入 tasks → executing
+ */
+async function generateAndReviewPlan(
+  pi: ExtensionAPI,
+  piDir: string,
+  taskFile: TaskFile,
+  spec: string,
+  ctx: ExtensionContext,
+): Promise<void> {
   const context = buildCompletedSummaries(taskFile);
+
   const planPrompt = await loadPrompt(piDir, "plan", {
     goal: taskFile.goal,
     spec,
@@ -227,124 +242,83 @@ async function handleBrainstorming(
   const result = await runSubagent(planPrompt, ctx.cwd, { tools: ["read", "bash"] });
   const plan = parseJson(result.output);
 
-  if (plan && Array.isArray(plan.tasks) && plan.tasks.length > 0) {
-    // ---- Plan 审查循环 ----
-    // 借鉴 superpowers/writing-plans 的 plan-document-reviewer：
-    // 生成计划后必须经过审查，确保粒度、覆盖性、TDD 节奏等。
-    const planReviewPrompt = await loadPrompt(piDir, "review-plan", {
+  if (!plan || !Array.isArray(plan.tasks) || plan.tasks.length === 0) {
+    // 生成失败 → 回到 brainstorming 让用户调整
+    await writeTaskFile(piDir, { ...taskFile, status: "brainstorming" });
+    pi.sendUserMessage("任务计划生成失败，请调整 spec 后重试。", { deliverAs: "followUp" });
+    return;
+  }
+
+  // 审查计划
+  const planReviewPrompt = await loadPrompt(piDir, "review-plan", {
+    goal: taskFile.goal,
+    spec,
+    planJson: JSON.stringify(plan.tasks, null, 2),
+  });
+
+  const planReviewResult = await runSubagent(planReviewPrompt, ctx.cwd, { tools: ["read"] });
+  const planReview = parseJson(planReviewResult.output);
+
+  let finalTasks = plan.tasks;
+
+  if (
+    planReview &&
+    planReview.approved === false &&
+    Array.isArray(planReview.issues) &&
+    planReview.issues.length > 0
+  ) {
+    // 审查不通过 → 带反馈重试一次
+    const issueList = planReview.issues
+      .map(
+        (i: { taskIndex: number; issue: string; suggestion: string }) =>
+          `- 任务 ${i.taskIndex + 1}: ${i.issue}（建议：${i.suggestion}）`,
+      )
+      .join("\n");
+
+    const retryPrompt = await loadPrompt(piDir, "plan", {
       goal: taskFile.goal,
       spec,
-      planJson: JSON.stringify(plan.tasks, null, 2),
+      context: `${context}\n\n## 上一版计划的审查意见（请根据意见修改）\n\n${issueList}`,
     });
 
-    const planReviewResult = await runSubagent(planReviewPrompt, ctx.cwd, { tools: ["read"] });
-    const planReview = parseJson(planReviewResult.output);
+    const retryResult = await runSubagent(retryPrompt, ctx.cwd, { tools: ["read", "bash"] });
+    const retryPlan = parseJson(retryResult.output);
 
-    if (
-      planReview &&
-      planReview.approved === false &&
-      Array.isArray(planReview.issues) &&
-      planReview.issues.length > 0
-    ) {
-      // 计划审查不通过 → 用审查意见重新生成
-      // 保持 planning 状态，附带审查反馈让 subagent 重新生成
-      const issueList = planReview.issues
-        .map(
-          (i: { taskIndex: number; issue: string; suggestion: string }) =>
-            `- 任务 ${i.taskIndex + 1}: ${i.issue}（建议：${i.suggestion}）`,
-        )
-        .join("\n");
-
-      const retryPrompt = await loadPrompt(piDir, "plan", {
-        goal: taskFile.goal,
-        spec,
-        context: `${context}\n\n## 上一版计划的审查意见（请根据意见修改）\n\n${issueList}`,
-      });
-
-      const retryResult = await runSubagent(retryPrompt, ctx.cwd, { tools: ["read", "bash"] });
-      const retryPlan = parseJson(retryResult.output);
-
-      if (retryPlan && Array.isArray(retryPlan.tasks) && retryPlan.tasks.length > 0) {
-        // 用修订后的计划
-        const planned: TaskFile = {
-          ...updated,
-          status: "executing",
-          tasks: retryPlan.tasks.map((t: { title: string }, i: number) => ({
-            id: String(i + 1).padStart(3, "0"),
-            title: t.title,
-            status: "pending" as const,
-            summary: null,
-          })),
-          currentTaskId: "001",
-        };
-        await writeTaskFile(piDir, planned);
-        pi.sendUserMessage(
-          `任务计划已审查修订，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`,
-          { deliverAs: "followUp" },
-        );
-      } else {
-        pi.sendUserMessage("任务计划修订失败，请重新生成。", { deliverAs: "followUp" });
-      }
-      return;
+    if (retryPlan && Array.isArray(retryPlan.tasks) && retryPlan.tasks.length > 0) {
+      finalTasks = retryPlan.tasks;
     }
-
-    // ---- Plan 审查通过，写入 task.json ----
-    const planned: TaskFile = {
-      ...updated,
-      status: "executing",
-      tasks: plan.tasks.map((t: { title: string }, i: number) => ({
-        id: String(i + 1).padStart(3, "0"),
-        title: t.title,
-        status: "pending" as const,
-        summary: null,
-      })),
-      currentTaskId: "001",
-    };
-    await writeTaskFile(piDir, planned);
-
-    pi.sendUserMessage(
-      `任务计划已生成并通过审查，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`,
-      {
-        deliverAs: "followUp",
-      },
-    );
-  } else {
-    pi.sendUserMessage("任务计划生成失败，请重新生成。", { deliverAs: "followUp" });
+    // 如果重试也失败，用原始计划（总比没有好）
   }
+
+  // 写入 tasks → executing
+  const planned: TaskFile = {
+    ...taskFile,
+    status: "executing",
+    tasks: finalTasks.map((t: { title: string }, i: number) => ({
+      id: String(i + 1).padStart(3, "0"),
+      title: t.title,
+      status: "pending" as const,
+      summary: null,
+    })),
+    currentTaskId: "001",
+  };
+  await writeTaskFile(piDir, planned);
+
+  pi.sendUserMessage(`任务计划已生成，共 ${planned.tasks.length} 个任务。开始执行第一个任务。`, {
+    deliverAs: "followUp",
+  });
 }
 
-/**
- * Planning 阶段的恢复处理。
- *
- * 正常流程中 handleBrainstorming 会直接跳到 executing。
- * 这个 handler 处理异常情况：如果中断恢复时 status 是 planning
- * 但 tasks 已经有了（说明上次中断在写入 tasks 之后、更新 status 之前），
- * 直接推进到 executing。
- */
-async function handlePlanning(
-  pi: ExtensionAPI,
-  piDir: string,
-  taskFile: TaskFile,
-  ctx: ExtensionContext,
-): Promise<void> {
-  if (taskFile.tasks.length > 0) {
-    const updated: TaskFile = {
-      ...taskFile,
-      status: "executing",
-      currentTaskId: taskFile.tasks[0].id,
-    };
-    await writeTaskFile(piDir, updated);
-    pi.sendUserMessage("进入执行阶段。", { deliverAs: "followUp" });
-  }
-}
+// ===========================================================================
+// 执行阶段 dispatch
+// ===========================================================================
 
 /**
- * 执行阶段：根据当前任务的状态分发到对应 handler。
+ * executing 阶段：根据当前任务状态分发。
  *
- * 返回值用于追踪修复循环：
- * - "fix_failed" — 验证失败，回到 in_progress（计数 +1）
- * - "fix_passed" — 验证通过或状态推进（计数重置）
- * - undefined — 其他情况（不影响计数）
+ * 关键规则：
+ * - preparing / reflecting / verifying 都是"正在进行"状态 → noop
+ * - 只有稳定状态（pending / ready / in_progress / done）才触发动作
  */
 async function handleExecuting(
   pi: ExtensionAPI,
@@ -367,12 +341,21 @@ async function handleExecuting(
     case "pending":
       await handleTaskPending(pi, piDir, taskFile, current, ctx);
       return "fix_passed";
+
     case "preparing":
-      await handleTaskPreparing(pi, piDir, taskFile, current, ctx);
-      return "fix_passed";
+      // subagent 正在生成 spec，noop
+      // 中断恢复：如果 spec 文件已存在，推进到 reflecting
+      await recoverPreparing(pi, piDir, taskFile, current, ctx);
+      return;
+
+    case "reflecting":
+      // subagent 正在反思规模，noop
+      return;
+
     case "ready":
       await handleTaskReady(pi, piDir, taskFile, current, ctx);
       return "fix_passed";
+
     case "in_progress":
       return await handleTaskInProgress(
         pi,
@@ -383,9 +366,13 @@ async function handleExecuting(
         filesModified,
         fixAttempts,
       );
+
     case "verifying":
-      await handleTaskVerifying(pi, piDir, taskFile, current, ctx);
+      // 硬编码检查 + subagent 审查正在进行，noop
+      // 中断恢复：退回 in_progress 等下一次文件变更
+      await recoverVerifying(pi, piDir, taskFile, current);
       return;
+
     case "done":
       await handleTaskDone(pi, piDir, taskFile, current, ctx);
       return "fix_passed";
@@ -397,13 +384,14 @@ async function handleExecuting(
 // ===========================================================================
 
 /**
- * pending → preparing：用 subagent 为任务生成详细 spec。
+ * pending → preparing → (subagent 生成 spec) → reflecting → (subagent 反思) → ready/split
  *
- * 对应设计："开始任务 A 的时候，进入任务A的预备状态，
- * 自动根据 spec 生成这个任务的预期、实施方案"
- *
- * 如果任务是从父任务拆分而来（splitFromId 非空），
- * 会读取父任务的旧 spec 作为额外上下文传给 subagent。
+ * 整个 pending 到 ready 的流程在一次 handler 调用中完成：
+ * 1. 写 preparing（防重入）
+ * 2. subagent 生成 spec
+ * 3. 写 reflecting（防重入）
+ * 4. subagent 反思规模
+ * 5. 写 ready 或 split
  */
 async function handleTaskPending(
   pi: ExtensionAPI,
@@ -412,23 +400,20 @@ async function handleTaskPending(
   task: Task,
   ctx: ExtensionContext,
 ): Promise<void> {
-  // 更新状态：pending → preparing
-  const updated = updateTaskStatus(taskFile, task.id, "preparing");
-  await writeTaskFile(piDir, updated);
+  // ---- 阶段 1：preparing（生成 spec）----
+  const preparing = updateTaskStatus(taskFile, task.id, "preparing");
+  await writeTaskFile(piDir, preparing);
 
   const projectSpec = await safeReadFile(join(piDir, "task", "spec.md"));
   const completedSummaries = buildCompletedSummaries(taskFile);
   const taskSpecPath = join(piDir, "task", task.id, "spec.md");
 
-  // 如果是拆分产生的任务，读取父任务的 spec 作为上下文
-  // 这实现了设计中的：
-  // "生成任务的时候需要拿之前那个过时的 spec 生成任务点和 summary"
   let parentSpec = "";
   if (task.splitFromId) {
     parentSpec = await safeReadFile(join(piDir, "task", task.splitFromId, "spec.md"));
   }
 
-  const prompt = await loadPrompt(piDir, "prepare-task", {
+  const preparePrompt = await loadPrompt(piDir, "prepare-task", {
     goal: taskFile.goal,
     projectSpec,
     taskId: task.id,
@@ -438,62 +423,59 @@ async function handleTaskPending(
     parentSpec,
   });
 
-  // subagent 需要 write 工具来写入 spec 文件
-  await runSubagent(prompt, ctx.cwd, { tools: ["read", "write", "bash"] });
+  await runSubagent(preparePrompt, ctx.cwd, { tools: ["read", "write", "bash"] });
 
-  // 下一轮 agent_end 会进入 handleTaskPreparing 做规模反思
-  pi.sendUserMessage("任务 spec 已生成，正在评估规模...", { deliverAs: "followUp" });
-}
+  // ---- 阶段 2：reflecting（反思规模）----
+  const reflecting = updateTaskStatus(preparing, task.id, "reflecting");
+  await writeTaskFile(piDir, reflecting);
 
-/**
- * preparing：用 subagent 反思任务规模，决定是否拆分。
- *
- * 对应设计："生成完文档之后总是思考：这个任务能不能在 15min 之内完成，
- * 或者能不能在 200k 上下文中完成"
- *
- * 如果反思结果是 feasible=false：
- * - 调用 splitTask() 将当前任务替换为多个子任务
- * - 子任务带 splitFromId，下一轮进入 handleTaskPending 时可以读取旧 spec
- * - 这形成了递归拆分，直到所有任务都足够小
- *
- * 如果 feasible=true：
- * - 更新状态为 ready，下一轮进入 handleTaskReady 开始实施
- */
-async function handleTaskPreparing(
-  pi: ExtensionAPI,
-  piDir: string,
-  taskFile: TaskFile,
-  task: Task,
-  ctx: ExtensionContext,
-): Promise<void> {
-  const taskSpecPath = join(piDir, "task", task.id, "spec.md");
   const taskSpec = (await safeReadFile(taskSpecPath)).trim();
-  if (!taskSpec) return; // spec 文件还没生成完，等下一轮
+  if (!taskSpec) {
+    // spec 生成失败 — 追踪重试次数，超过 3 次则跳过该任务
+    const attempts = (task.prepareAttempts || 0) + 1;
+    if (attempts >= 3) {
+      let updated = updateTaskStatus(reflecting, task.id, "done");
+      updated = updateTaskSummary(updated, task.id, `跳过：spec 生成连续失败 ${attempts} 次`);
+      updated = advanceToNextTask(updated);
+      await writeTaskFile(piDir, updated);
+      pi.sendUserMessage(`⚠️ 任务 ${task.id} 的 spec 生成连续失败 ${attempts} 次，已跳过。`, {
+        deliverAs: "followUp",
+      });
+      return;
+    }
 
-  // subagent 反思任务规模
-  const prompt = await loadPrompt(piDir, "reflect-size", { taskSpec });
-  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read"] });
-  const reflection = parseJson(result.output);
+    // 回到 pending，记录重试次数
+    const reverted: TaskFile = {
+      ...reflecting,
+      tasks: reflecting.tasks.map((t) =>
+        t.id === task.id ? { ...t, status: "pending" as const, prepareAttempts: attempts } : t,
+      ),
+    };
+    await writeTaskFile(piDir, reverted);
+    pi.sendUserMessage(`任务 ${task.id} 的 spec 生成失败（第 ${attempts} 次），将在下一轮重试。`, {
+      deliverAs: "followUp",
+    });
+    return;
+  }
+
+  const reflectPrompt = await loadPrompt(piDir, "reflect-size", { taskSpec });
+  const reflectResult = await runSubagent(reflectPrompt, ctx.cwd, { tools: ["read"] });
+  const reflection = parseJson(reflectResult.output);
 
   if (
     reflection?.feasible === false &&
     Array.isArray(reflection.tasks) &&
     reflection.tasks.length > 0
   ) {
-    // ---- 任务太大，拆分 ----
-    // splitTask 会：
-    // 1. 移除原任务
-    // 2. 在原位置插入新的 pending 子任务
-    // 3. 新任务带 splitFromId 指向原任务 ID
-    // 4. currentTaskId 指向第一个新任务
-    const updated = splitTask(taskFile, task.id, reflection.tasks);
+    // 任务太大，拆分
+    const updated = splitTask(reflecting, task.id, reflection.tasks);
     await writeTaskFile(piDir, { ...updated, status: "executing" });
     pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
       deliverAs: "followUp",
     });
   } else {
-    // ---- 任务可行，进入 ready ----
-    const updated = updateTaskStatus(taskFile, task.id, "ready");
+    // 任务可行 → ready
+    const updated = updateTaskStatus(reflecting, task.id, "ready");
     await writeTaskFile(piDir, updated);
     pi.sendUserMessage(
       `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
@@ -503,17 +485,71 @@ async function handleTaskPreparing(
 }
 
 /**
+ * 中断恢复：如果 preparing 状态下 spec 已存在，推进到 reflecting 继续。
+ */
+async function recoverPreparing(
+  pi: ExtensionAPI,
+  piDir: string,
+  taskFile: TaskFile,
+  task: Task,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const taskSpecPath = join(piDir, "task", task.id, "spec.md");
+  const taskSpec = (await safeReadFile(taskSpecPath)).trim();
+  if (!taskSpec) return; // spec 还没生成完，继续等
+
+  // spec 已存在但状态还是 preparing → subagent 完成了但状态没推进
+  // 进入 reflecting 继续
+  const reflecting = updateTaskStatus(taskFile, task.id, "reflecting");
+  await writeTaskFile(piDir, reflecting);
+
+  const reflectPrompt = await loadPrompt(piDir, "reflect-size", { taskSpec });
+  const reflectResult = await runSubagent(reflectPrompt, ctx.cwd, { tools: ["read"] });
+  const reflection = parseJson(reflectResult.output);
+
+  if (
+    reflection?.feasible === false &&
+    Array.isArray(reflection.tasks) &&
+    reflection.tasks.length > 0
+  ) {
+    const updated = splitTask(reflecting, task.id, reflection.tasks);
+    await writeTaskFile(piDir, { ...updated, status: "executing" });
+    pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
+      deliverAs: "followUp",
+    });
+  } else {
+    const updated = updateTaskStatus(reflecting, task.id, "ready");
+    await writeTaskFile(piDir, updated);
+    pi.sendUserMessage(
+      `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
+      { deliverAs: "followUp" },
+    );
+  }
+}
+
+/**
+ * 中断恢复：verifying 状态退回 in_progress。
+ *
+ * 如果中断在 verifying 阶段恢复，验证过程不完整，
+ * 退回 in_progress 并通知 agent 继续工作。
+ * 不发消息会导致 agent 静默卡死（in_progress + filesModified=false = noop）。
+ */
+async function recoverVerifying(
+  pi: ExtensionAPI,
+  piDir: string,
+  taskFile: TaskFile,
+  task: Task,
+): Promise<void> {
+  const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
+  await writeTaskFile(piDir, reverted);
+  pi.sendUserMessage(
+    `任务 ${task.id} 的验证过程被中断，已恢复到实施状态。请继续完成任务并提交变更。`,
+    { deliverAs: "followUp" },
+  );
+}
+
+/**
  * ready → in_progress：注入实施 prompt 给主 agent。
- *
- * 这是主 agent 真正开始写代码的入口。
- * prompt 中要求：
- * - 按 spec 实施
- * - 通过 lint / typecheck / test
- * - **必须编写 harness**（自验证测试）
- *
- * 为什么是主 agent 而非 subagent？
- * 因为实施任务可能涉及复杂的代码编写、调试、多轮工具调用，
- * 需要完整的上下文和工具链。
  */
 async function handleTaskReady(
   pi: ExtensionAPI,
@@ -571,20 +607,10 @@ async function handleTaskReady(
 }
 
 /**
- * in_progress → verifying：当有文件变更时触发验证流程。
+ * in_progress → verifying → (检查 + 审查) → done 或回到 in_progress。
  *
- * 对应设计中的两阶段验证：
- * 1. 硬编码检查（runHardcodedChecks）：lint + typecheck + test
- * 2. LLM 质量反思（handleQualityReflection）：subagent 审查 + 检查 harness
- *
- * 如果任何一步失败，状态回到 in_progress，注入错误信息让主 agent 修复。
- * 这形成了 in_progress ↔ verifying 的循环，直到两个指标都通过。
- *
- * 借鉴 systematic-debugging：
- * 当修复循环超过 2 次（fixAttempts >= 2），注入系统化调试指导，
- * 要求 agent 停止盲目尝试，先做根因调查再提修复方案。
- *
- * 返回 "fix_failed" / "fix_passed" 供调用方追踪循环次数。
+ * 关键：先写 verifying 再跑检查。
+ * 检查/审查完成后：通过 → done，不通过 → in_progress。
  */
 async function handleTaskInProgress(
   pi: ExtensionAPI,
@@ -595,19 +621,18 @@ async function handleTaskInProgress(
   filesModified: boolean,
   fixAttempts: number,
 ): Promise<"fix_failed" | "fix_passed" | undefined> {
-  if (!filesModified) return; // 没有文件变更，不触发验证
+  if (!filesModified) return;
 
-  // 标记为验证中
-  const updated = updateTaskStatus(taskFile, task.id, "verifying");
-  await writeTaskFile(piDir, updated);
+  // ---- 先写 verifying 状态 ----
+  const verifying = updateTaskStatus(taskFile, task.id, "verifying");
+  await writeTaskFile(piDir, verifying);
 
   // ---- 阶段 1：硬编码检查 ----
   const checks = await runHardcodedChecks(pi);
   if (checks.errors.length > 0) {
-    const reverted = updateTaskStatus(updated, task.id, "in_progress");
+    const reverted = updateTaskStatus(verifying, task.id, "in_progress");
     await writeTaskFile(piDir, reverted);
 
-    // 超过 2 次修复失败 → 注入系统化调试指导
     let message = `硬编码检查未通过，请修复：\n\n${checks.errors.join("\n\n")}`;
     if (fixAttempts >= 2) {
       const debugGuide = await loadPrompt(piDir, "debug-guide", {});
@@ -619,33 +644,12 @@ async function handleTaskInProgress(
   }
 
   // ---- 阶段 2：LLM 两阶段评审 ----
-  const passed = await handleQualityReflection(pi, piDir, updated, task, ctx, fixAttempts);
+  const passed = await handleQualityReflection(pi, piDir, verifying, task, ctx, fixAttempts);
   return passed ? "fix_passed" : "fix_failed";
 }
 
 /**
- * verifying 状态的恢复处理。
- *
- * 正常流程中 handleTaskInProgress 会直接处理验证。
- * 如果中断恢复时停在 verifying，说明验证过程被打断，
- * 这里不做操作，等下一轮有文件变更时重新触发。
- */
-async function handleTaskVerifying(
-  _pi: ExtensionAPI,
-  _piDir: string,
-  _taskFile: TaskFile,
-  _task: Task,
-  _ctx: ExtensionContext,
-): Promise<void> {
-  // 验证由 handleTaskInProgress 驱动。
-  // 如果落到这里说明验证已经在进行中，等待下一个触发。
-}
-
-/**
- * done 状态的恢复处理：推进到下一个任务。
- *
- * 正常流程中 handleGenerateReport 会调用 advanceToNextTask。
- * 如果中断恢复时停在 done，继续推进。
+ * done → 推进到下一个任务。
  */
 async function handleTaskDone(
   pi: ExtensionAPI,
@@ -669,19 +673,12 @@ async function handleTaskDone(
 // ===========================================================================
 
 /**
- * 两阶段评审：先 spec 一致性，再代码质量。
+ * 两阶段评审：spec 一致性 → 代码质量。
  *
- * 借鉴自 superpowers/subagent-driven-development 的核心理念：
- * - 阶段 1（spec compliance）：做了没有？做对没有？有没有多做？harness 在不在？
- * - 阶段 2（code quality）：写得好不好？结构清晰吗？测试质量高吗？
- *   融入了 testing-anti-patterns 和 defense-in-depth 检查。
+ * 此时状态已经是 verifying（由 handleTaskInProgress 写入），
+ * 所以 agent_end 重入时会 noop。
  *
- * **必须先通过 spec compliance 才能进入 code quality。**
- *
- * 任何阶段不通过 → 回到 in_progress，让主 agent 修复（循环）。
- * 两阶段都通过 → 进入报告生成。
- *
- * 返回 true 表示通过，false 表示需要修复。
+ * 返回 true = 通过，false = 需要修复。
  */
 async function handleQualityReflection(
   pi: ExtensionAPI,
@@ -696,7 +693,6 @@ async function handleQualityReflection(
   const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
 
   // ---- 阶段 1：Spec 一致性审查 ----
-  // "实现者完成得很快，他们的报告可能不完整、不准确或过于乐观。你必须独立验证一切。"
   const specCompliancePrompt = await loadPrompt(piDir, "review-spec-compliance", {
     taskSpec,
     gitStatus: gitStatus.stdout || "(clean)",
@@ -707,7 +703,6 @@ async function handleQualityReflection(
   const specReview = parseJson(specResult.output);
 
   if (specReview && specReview.compliant === false) {
-    // spec 一致性不通过 → 回到 in_progress
     const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
     await writeTaskFile(piDir, reverted);
 
@@ -736,9 +731,6 @@ async function handleQualityReflection(
   }
 
   // ---- 阶段 2：代码质量审查 ----
-  // 只有 spec 一致性通过后才进行代码质量审查
-  // 融入了 testing-anti-patterns（mock 行为测试、仅测试用方法等）
-  // 和 defense-in-depth（多层验证检查）
   const codeQualityPrompt = await loadPrompt(piDir, "review-code-quality", {
     taskSpec,
     gitDiff: gitDiff.stdout || "(no changes)",
@@ -748,7 +740,6 @@ async function handleQualityReflection(
   const qualityReview = parseJson(qualityResult.output);
 
   if (qualityReview && qualityReview.approved === false) {
-    // 代码质量不通过 → 回到 in_progress
     const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
     await writeTaskFile(piDir, reverted);
 
@@ -770,25 +761,16 @@ async function handleQualityReflection(
     return false;
   }
 
-  // 两阶段都通过 → 生成完成报告
+  // ---- 两阶段都通过 → 生成报告 ----
   await handleGenerateReport(pi, piDir, taskFile, task, ctx);
   return true;
 }
 
 /**
- * 生成任务完成报告。
+ * 生成完成报告 + 间隙分析 + 推进。
  *
- * subagent 读取 git 工作区信息，生成 report.md 并返回 summary。
- *
- * 对应设计：
- * "生成任务 a 的完成报告 summary，以及是否针对能在 15min 中完成，
- * 能不能在 200k 上下文完成"
- *
- * 完成后：
- * 1. 更新任务状态为 done
- * 2. 将 summary 写入 task.json（供后续间隙分析参考）
- * 3. 推进到下一个任务
- * 4. 执行间隙分析
+ * 此时状态是 verifying，所以不会被重入。
+ * 完成后直接写 done + advanceToNextTask。
  */
 async function handleGenerateReport(
   pi: ExtensionAPI,
@@ -800,7 +782,6 @@ async function handleGenerateReport(
   const taskSpec = await safeReadFile(join(piDir, "task", task.id, "spec.md"));
   const reportPath = join(piDir, "task", task.id, "report.md");
 
-  // 收集 git 信息供 subagent 分析
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
   const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
   const gitLog = await pi.exec("git", ["log", "--oneline", "-10"], { timeout: 10_000 });
@@ -817,13 +798,13 @@ async function handleGenerateReport(
   const report = parseJson(result.output);
   const summary = report?.summary || `任务 ${task.id} 已完成`;
 
-  // 更新状态为 done + 写入 summary + 推进到下一个任务
+  // done + summary + advance — 一次性写入
   let updated = updateTaskStatus(taskFile, task.id, "done");
   updated = updateTaskSummary(updated, task.id, summary);
   updated = advanceToNextTask(updated);
   await writeTaskFile(piDir, updated);
 
-  // 间隙分析：检查是否需要在当前任务和下一个任务之间插入中间任务
+  // 间隙分析
   await handleGapAnalysis(pi, piDir, updated, task, ctx);
 }
 
@@ -832,17 +813,9 @@ async function handleGenerateReport(
 // ===========================================================================
 
 /**
- * 任务间隙分析：判断已完成任务和下一个任务之间是否需要插入中间任务。
+ * 间隙分析：已完成任务 → 下一任务之间是否需要插入中间任务。
  *
- * 对应设计：
- * "分析已完成的任务a 和 任务计划的下一个任务 b + spec + a的完成报告summary，
- * 判断要不要在 a b 中增加中间任务（随时反思计划补充任务）"
- *
- * subagent 接收：总目标 + spec + 已完成任务摘要 + 下一任务信息
- * subagent 输出：needsIntermediateTasks + 任务列表
- *
- * 如果需要插入 → insertTasksAfter → 更新 currentTaskId → 继续
- * 如果不需要 → 直接进入下一个任务
+ * 在 handleGenerateReport 内同步调用，状态仍在安全的 done+advanced 后。
  */
 async function handleGapAnalysis(
   pi: ExtensionAPI,
@@ -854,7 +827,6 @@ async function handleGapAnalysis(
   const nextTask = getCurrentTask(taskFile);
 
   if (!nextTask) {
-    // 没有下一个任务 → 所有任务完成，进入最终验收
     if (allTasksDone(taskFile)) {
       await handleFinalValidation(pi, piDir, taskFile, ctx);
     }
@@ -879,7 +851,6 @@ async function handleGapAnalysis(
   const gap = parseJson(result.output);
 
   if (gap?.needsIntermediateTasks && Array.isArray(gap.tasks) && gap.tasks.length > 0) {
-    // 需要插入中间任务
     const updated = insertTasksAfter(taskFile, completedTask.id, gap.tasks);
     const firstNew = updated.tasks.find((t) => t.status === "pending");
     if (firstNew) {
@@ -891,7 +862,6 @@ async function handleGapAnalysis(
     }
   }
 
-  // 不需要插入，直接进入下一个任务
   pi.sendUserMessage(
     `任务 ${completedTask.id} 完成。进入下一个任务：${nextTask.id} - ${nextTask.title}`,
     { deliverAs: "followUp" },
@@ -903,23 +873,40 @@ async function handleGapAnalysis(
 // ===========================================================================
 
 /**
- * 最终验收：所有任务完成后，判断是否满足总目标 spec。
+ * 最终验收：所有任务完成 → validating → subagent 判定。
  *
- * 对应设计：
- * "直到最后一个任务都完成了，判断是不是符合了任务的 spec，
- * 没有完成就继续深化任务列表"
- *
- * 这是一个闭环：
- * - subagent 判断 passed=true → status 变为 completed，结束
- * - subagent 判断 passed=false + 返回补充任务 → insertTasksAfter → 继续 executing
- * - subagent 判断 passed=false 但没返回任务 → fallback 给主 agent 手动处理
+ * 关键：先写 validating 再跑 subagent。
+ * agent_end 读到 validating 就 noop。
  */
+/**
+ * 最大最终验收尝试次数。
+ * 超过后强制标记完成，交给用户手动处理，避免无限追加任务。
+ */
+const MAX_VALIDATION_ATTEMPTS = 3;
+
 async function handleFinalValidation(
   pi: ExtensionAPI,
   piDir: string,
   taskFile: TaskFile,
   ctx: ExtensionContext,
 ): Promise<void> {
+  const attempts = (taskFile.validationAttempts || 0) + 1;
+
+  // 超过最大尝试次数 → 强制完成
+  if (attempts > MAX_VALIDATION_ATTEMPTS) {
+    const completed: TaskFile = { ...taskFile, status: "completed", validationAttempts: attempts };
+    await writeTaskFile(piDir, completed);
+    sendMessage(
+      pi,
+      ctx,
+      `## 最终验收已达上限（${MAX_VALIDATION_ATTEMPTS} 次）\n\n已强制标记为完成。请手动检查是否满足需求。`,
+    );
+    return;
+  }
+
+  // ---- 先写 validating + 递增计数 ----
+  await writeTaskFile(piDir, { ...taskFile, status: "validating", validationAttempts: attempts });
+
   const projectSpec = await safeReadFile(join(piDir, "task", "spec.md"));
   const completedSummaries = buildCompletedSummaries(taskFile);
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
@@ -935,18 +922,14 @@ async function handleFinalValidation(
   const validation = parseJson(result.output);
 
   if (validation?.passed === true) {
-    // ---- 验收通过 → 进入收尾流程 ----
-    // 借鉴 superpowers/finishing-a-development-branch：
-    // 验收通过后执行收尾（提交变更、验证、生成总结）
+    // 验收通过
     const completed: TaskFile = { ...taskFile, status: "completed" };
     await writeTaskFile(piDir, completed);
 
-    const completedSummaries = buildCompletedSummaries(completed);
     const finishGitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
-
     const finishPrompt = await loadPrompt(piDir, "finish", {
       goal: completed.goal,
-      completedSummaries,
+      completedSummaries: buildCompletedSummaries(completed),
       gitStatus: finishGitStatus.stdout || "(clean)",
     });
 
@@ -958,9 +941,8 @@ async function handleFinalValidation(
     return;
   }
 
-  // ---- 验收未通过 → 追加补充任务，继续执行 ----
+  // 验收未通过 → 追加补充任务
   if (validation?.tasks && Array.isArray(validation.tasks) && validation.tasks.length > 0) {
-    // 找到最后一个 done 的任务，在其后面插入
     const lastDone = [...taskFile.tasks].reverse().find((t) => t.status === "done");
     const afterId = lastDone?.id ?? taskFile.tasks[taskFile.tasks.length - 1]?.id;
 
@@ -972,6 +954,7 @@ async function handleFinalValidation(
           ...updated,
           status: "executing",
           currentTaskId: firstNew.id,
+          validationAttempts: 0, // 有新任务了，重置验收计数
         });
         pi.sendUserMessage(
           `最终验收未通过：${validation.reason || ""}\n已追加 ${validation.tasks.length} 个补充任务，继续执行。`,
@@ -982,11 +965,14 @@ async function handleFinalValidation(
     }
   }
 
-  // Fallback：subagent 未能返回有效的补充任务，交给主 agent
+  // Fallback：subagent 未返回有效的补充任务 → 强制完成，交给用户
+  // 不能回到 executing，否则 allTasksDone → 又进 handleFinalValidation → 死循环
+  const completed: TaskFile = { ...taskFile, status: "completed", validationAttempts: attempts };
+  await writeTaskFile(piDir, completed);
   sendMessage(
     pi,
     ctx,
-    `## 最终验收未通过\n\n${validation?.reason || "未能确定原因。"}\n\n请手动补充任务或调整 spec。`,
+    `## 最终验收未通过\n\n${validation?.reason || "未能确定原因。"}\n\n已标记为完成，请手动检查和补充。`,
   );
 }
 
@@ -994,21 +980,6 @@ async function handleFinalValidation(
 // 硬编码检查
 // ===========================================================================
 
-/**
- * 运行硬编码质量检查：fmt → lint → typecheck → test。
- *
- * 对应设计：
- * "（硬编码质量要求）完成任务a后进行 lint，typecheck，测试覆盖率100%"
- *
- * 按顺序执行，遇到错误立即返回（避免后续检查浪费时间）：
- * 1. oxfmt packages     — 格式化
- * 2. oxlint --fix packages — lint + 自动修复
- * 3. typecheck           — TypeScript 类型检查
- * 4. test                — 运行测试（要求 100% 覆盖率）
- *
- * 注意：这里用 npx 直接调用而不是 pnpm run，
- * 因为 pi.exec 执行 pnpm run 在某些环境下会返回错误的退出码。
- */
 async function runHardcodedChecks(pi: ExtensionAPI): Promise<{ errors: string[] }> {
   const errors: string[] = [];
 
@@ -1024,7 +995,7 @@ async function runHardcodedChecks(pi: ExtensionAPI): Promise<{ errors: string[] 
     if (out) errors.push(`\`oxlint --fix\` failed (exit ${lintResult.code}):\n${out}`);
   }
 
-  if (errors.length > 0) return { errors }; // 格式/lint 错误先修，不继续
+  if (errors.length > 0) return { errors };
 
   const tcResult = await pi.exec("pnpm", ["--filter", "webm-extension-demo", "run", "typecheck"], {
     timeout: 60_000,
@@ -1034,7 +1005,7 @@ async function runHardcodedChecks(pi: ExtensionAPI): Promise<{ errors: string[] 
     if (out) errors.push(`\`typecheck\` failed (exit ${tcResult.code}):\n${out}`);
   }
 
-  if (errors.length > 0) return { errors }; // typecheck 错误先修，不继续
+  if (errors.length > 0) return { errors };
 
   const testResult = await pi.exec("pnpm", ["--filter", "webm-extension-demo", "run", "test"], {
     timeout: 120_000,
@@ -1051,17 +1022,6 @@ async function runHardcodedChecks(pi: ExtensionAPI): Promise<{ errors: string[] 
 // 工具函数
 // ===========================================================================
 
-/**
- * 智能发送消息：根据 agent 是否空闲选择发送方式。
- *
- * - 空闲时：直接发送，立即触发新回合
- * - 忙碌时：用 followUp 排队，等当前回合结束后再送达
- *
- * pi 的消息投递模式：
- * - sendUserMessage(text)                → 立即发送（agent 必须空闲）
- * - sendUserMessage(text, {deliverAs: 'steer'})   → 当前 turn 后投递
- * - sendUserMessage(text, {deliverAs: 'followUp'}) → agent 完全空闲后投递
- */
 function sendMessage(pi: ExtensionAPI, ctx: ExtensionContext, text: string): void {
   if (ctx.isIdle()) {
     pi.sendUserMessage(text);
@@ -1070,25 +1030,10 @@ function sendMessage(pi: ExtensionAPI, ctx: ExtensionContext, text: string): voi
   }
 }
 
-/**
- * 健壮的 JSON 解析：尝试多种方式从 LLM 输出中提取 JSON。
- *
- * LLM 经常不严格遵守"只输出 JSON"的指令，可能会：
- * 1. 直接输出纯 JSON（最理想）
- * 2. 包裹在 ```json ... ``` 代码块中
- * 3. 在 JSON 前后加了解释文本
- *
- * 本函数按优先级尝试：
- * 1. 直接 JSON.parse
- * 2. 从 markdown 代码块中提取
- * 3. 找到第一个 { 到最后一个 } 的范围
- */
 function parseJson(text: string): any {
-  // 尝试 1：直接解析
   try {
     return JSON.parse(text.trim());
   } catch {
-    // 尝试 2：从 markdown 代码块提取
     const match = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
     if (match) {
       try {
@@ -1097,7 +1042,6 @@ function parseJson(text: string): any {
         /* fall through */
       }
     }
-    // 尝试 3：找 { ... } 范围
     const start = text.indexOf("{");
     const end = text.lastIndexOf("}");
     if (start !== -1 && end > start) {

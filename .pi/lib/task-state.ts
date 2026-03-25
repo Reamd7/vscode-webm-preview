@@ -20,30 +20,47 @@ import { join, dirname } from "node:path";
 /**
  * 项目级别的状态，对应整个任务系统的生命周期阶段。
  *
- * brainstorming → planning → executing → completed
+ * brainstorming → reviewing_spec → planning → executing → validating → completed
  *
- * - brainstorming: 主 agent 与用户交互，细化需求，生成 spec.md
- * - planning:      subagent 根据 spec 生成任务列表写入 task.json
- * - executing:     逐个执行任务（大部分时间都在这个阶段）
- * - completed:     所有任务完成且通过最终验收
+ * - brainstorming:  主 agent 与用户交互，细化需求，生成 spec.md
+ * - reviewing_spec: subagent 正在审查 spec（防止重入）
+ * - planning:       subagent 根据 spec 生成任务列表写入 task.json
+ * - executing:      逐个执行任务（大部分时间都在这个阶段）
+ * - validating:     subagent 正在做最终验收（防止重入）
+ * - completed:      所有任务完成且通过最终验收
  */
-export type ProjectStatus = "brainstorming" | "planning" | "executing" | "completed";
+export type ProjectStatus =
+  | "brainstorming"
+  | "reviewing_spec"
+  | "planning"
+  | "executing"
+  | "validating"
+  | "completed";
 
 /**
  * 单个任务的状态，对应每个任务的生命周期阶段。
  *
- * pending → preparing → ready → in_progress → verifying → done
- *                                    ↑             |
- *                                    └── failed ───┘
+ * pending → preparing → reflecting → ready → in_progress → verifying → done
+ *               |                                  ↑             |
+ *               |                                  └── failed ───┘
+ *               └── split (回到 pending 的子任务)
  *
  * - pending:     只有标题，还没有展开（避免信息过载）
- * - preparing:   subagent 正在生成任务 spec + 反思任务规模
+ * - preparing:   subagent 正在生成任务 spec
+ * - reflecting:  subagent 正在反思任务规模（15min/200k），决定是否拆分
  * - ready:       spec 已确认可在 15min/200k 内完成，等待实施
  * - in_progress: 主 agent 正在实施任务
  * - verifying:   硬编码检查 + LLM 质量反思
  * - done:        通过验证，完成报告已生成
  */
-export type TaskStatus = "pending" | "preparing" | "ready" | "in_progress" | "verifying" | "done";
+export type TaskStatus =
+  | "pending"
+  | "preparing"
+  | "reflecting"
+  | "ready"
+  | "in_progress"
+  | "verifying"
+  | "done";
 
 /**
  * 单个任务的数据结构。
@@ -60,21 +77,27 @@ export interface Task {
   summary: string | null;
   /** ID of the task this was split from (for inheriting parent spec context). */
   splitFromId?: string;
+  /** spec 生成连续失败次数（防止无限重试）。 */
+  prepareAttempts?: number;
 }
 
 /**
  * task.json 的完整结构。
  *
- * - goal:          用户的原始目标文本（从 agent-loop.txt 读取）
- * - status:        项目级别状态
- * - currentTaskId: 当前正在处理的任务 ID（串行执行，永远只有一个）
- * - tasks:         扁平任务列表，按执行顺序排列
+ * - goal:                用户的原始目标文本（从 agent-loop.txt 读取）
+ * - status:              项目级别状态
+ * - currentTaskId:       当前正在处理的任务 ID（串行执行，永远只有一个）
+ * - tasks:               扁平任务列表，按执行顺序排列
+ * - validationAttempts:  最终验收的连续尝试次数（用于防止无限验收循环）
  */
 export interface TaskFile {
   goal: string;
   status: ProjectStatus;
   currentTaskId: string | null;
   tasks: Task[];
+  validationAttempts?: number;
+  /** spec 审查不通过时记录的 spec 内容哈希，防止对同一份 spec 重复审查。 */
+  _lastReviewedSpecHash?: string;
 }
 
 // --- Read / Write ---

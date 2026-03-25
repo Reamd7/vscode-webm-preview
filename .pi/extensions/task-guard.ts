@@ -244,6 +244,7 @@ function formatTaskView(taskFile: TaskFile): string {
   const statusIcon: Record<string, string> = {
     pending: "⏳",
     preparing: "📝",
+    reflecting: "🤔",
     ready: "✅",
     in_progress: "🔧",
     verifying: "🔍",
