@@ -143,12 +143,18 @@ async function handleNoTaskFile(
 }
 
 /**
- * 头脑风暴阶段：等待 spec.md 生成。
+ * 头脑风暴阶段：等待 spec.md 生成，然后进行 spec 审查循环。
  *
  * 这个阶段主 agent 与用户交互，不断细化需求。
  * 每次 agent_end 都会检查 spec.md 是否已存在：
  * - 不存在 → 不做任何事，让用户继续交互
- * - 已存在 → 进入 planning，用 subagent 生成任务计划
+ * - 已存在 → subagent 审查 spec 质量
+ *   - 审查通过 → 进入 planning，用 subagent 生成任务计划
+ *   - 审查不通过 → 注入问题列表，让主 agent 修复 spec（循环）
+ *
+ * 借鉴自 superpowers/brainstorming 的 spec 审查循环：
+ * 写完 spec 后派发 reviewer subagent 检查完整性、一致性、YAGNI，
+ * 确保 spec 质量足够高再进入 planning。
  */
 async function handleBrainstorming(
   pi: ExtensionAPI,
@@ -156,10 +162,39 @@ async function handleBrainstorming(
   taskFile: TaskFile,
   ctx: ExtensionContext,
 ): Promise<void> {
-  const spec = (await safeReadFile(join(piDir, "task", "spec.md"))).trim();
+  const specPath = join(piDir, "task", "spec.md");
+  const spec = (await safeReadFile(specPath)).trim();
   if (!spec) return; // spec 还没写完，继续等
 
-  // ---- spec 已生成，进入 planning ----
+  // ---- Spec 审查循环 ----
+  // 借鉴 superpowers/brainstorming 的 spec-document-reviewer：
+  // 写完 spec 后必须先审查，通过才能进入 planning。
+  const reviewPrompt = await loadPrompt(piDir, "review-spec", {
+    specContent: spec,
+  });
+  const reviewResult = await runSubagent(reviewPrompt, ctx.cwd, { tools: ["read"] });
+  const review = parseJson(reviewResult.output);
+
+  if (
+    review &&
+    review.approved === false &&
+    Array.isArray(review.issues) &&
+    review.issues.length > 0
+  ) {
+    // spec 审查不通过 → 让主 agent 修复
+    const issueList = review.issues
+      .map(
+        (i: { section: string; issue: string; reason: string }) =>
+          `- **${i.section}**: ${i.issue}（${i.reason}）`,
+      )
+      .join("\n");
+    pi.sendUserMessage(`Spec 审查未通过，请修改 \`${specPath}\` 后继续：\n\n${issueList}`, {
+      deliverAs: "followUp",
+    });
+    return; // 保持 brainstorming 状态，下一轮再检查
+  }
+
+  // ---- spec 审查通过，进入 planning ----
 
   const updated: TaskFile = { ...taskFile, status: "planning" };
   await writeTaskFile(piDir, updated);
@@ -412,10 +447,36 @@ async function handleTaskReady(
     "",
     taskSpec,
     "",
-    "## 要求",
+    "## TDD 要求（强制）",
+    "",
+    "严格遵循 Red-Green-Refactor 循环：",
+    "1. **RED**：先写一个失败的测试，明确期望行为",
+    "2. **验证 RED**：运行测试，确认它以正确的方式失败（缺少功能，而非拼写错误）",
+    "3. **GREEN**：写最小实现使测试通过，不要多写",
+    "4. **验证 GREEN**：运行测试，确认通过且没有破坏其他测试",
+    "5. **REFACTOR**：整理代码，保持测试为绿",
+    "6. 对下一个功能点重复以上循环",
+    "",
+    "**禁止**：先写实现再补测试。如果已经写了实现代码，删掉，从测试重新开始。",
+    "",
+    "## 质量要求",
+    "",
     "- 代码需要通过 lint, typecheck, 测试",
     "- 测试覆盖率 100%",
     "- **必须编写自验证测试（harness）**：针对本任务 spec 中的验收标准，编写测试用例验证你的实现行为是否符合预期",
+    "- 测试验证真实行为，不要过度依赖 mock",
+    "- 每个测试只测一件事，名字清晰描述行为",
+    "",
+    "## 完成前验证（强制）",
+    "",
+    "在声称完成之前，你必须：",
+    "1. 运行 `pnpm test` 并确认全部通过",
+    "2. 运行 `pnpm typecheck` 并确认无错误",
+    "3. 运行 `pnpm lint` 并确认无错误",
+    "4. 将以上命令的实际输出贴出来作为证据",
+    "",
+    "**没有验证证据就不能声称完成。**",
+    "",
     "- 完成后告知我",
   ].join("\n");
 
@@ -512,19 +573,16 @@ async function handleTaskDone(
 // ===========================================================================
 
 /**
- * LLM 质量反思：subagent 审查代码变更是否满足 spec。
+ * 两阶段评审：先 spec 一致性，再代码质量。
  *
- * 对应设计：
- * "（任务质量要求）llm 反思任务完成质量是否满足预期"
- * "编写自验证（harness）验证自己的行为是否符合预期"
+ * 借鉴自 superpowers/subagent-driven-development 的核心理念：
+ * - 阶段 1（spec compliance）：做了没有？做对没有？有没有多做？harness 在不在？
+ * - 阶段 2（code quality）：写得好不好？结构清晰吗？测试质量高吗？
  *
- * verify-quality.md prompt 会检查：
- * 1. 代码是否满足 spec 验收标准
- * 2. harness 测试是否存在
- * 3. 测试覆盖了关键路径
+ * **必须先通过 spec compliance 才能进入 code quality。**
  *
- * 如果 passed=false → 回到 in_progress 让主 agent 修复（循环）
- * 如果 passed=true → 进入报告生成
+ * 任何阶段不通过 → 回到 in_progress，让主 agent 修复（循环）。
+ * 两阶段都通过 → 进入报告生成。
  */
 async function handleQualityReflection(
   pi: ExtensionAPI,
@@ -535,29 +593,74 @@ async function handleQualityReflection(
 ): Promise<void> {
   const taskSpec = await safeReadFile(join(piDir, "task", task.id, "spec.md"));
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
-  const gitDiff = await pi.exec("git", ["diff", "--stat"], { timeout: 10_000 });
+  const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
 
-  const prompt = await loadPrompt(piDir, "verify-quality", {
+  // ---- 阶段 1：Spec 一致性审查 ----
+  // "实现者完成得很快，他们的报告可能不完整、不准确或过于乐观。你必须独立验证一切。"
+  const specCompliancePrompt = await loadPrompt(piDir, "review-spec-compliance", {
     taskSpec,
     gitStatus: gitStatus.stdout || "(clean)",
     gitDiff: gitDiff.stdout || "(no changes)",
   });
 
-  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read", "bash"] });
-  const quality = parseJson(result.output);
+  const specResult = await runSubagent(specCompliancePrompt, ctx.cwd, { tools: ["read", "bash"] });
+  const specReview = parseJson(specResult.output);
 
-  if (quality?.passed === false) {
-    // 质量不达标 → 回到 in_progress，形成修复循环
+  if (specReview && specReview.compliant === false) {
+    // spec 一致性不通过 → 回到 in_progress
     const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
     await writeTaskFile(piDir, reverted);
-    const issues = (quality.issues || []).join("\n- ");
-    pi.sendUserMessage(`任务质量检查未通过：\n- ${issues}\n\n请修复后继续。`, {
+
+    const issues: string[] = [];
+    if (specReview.missing?.length)
+      issues.push(
+        `**缺失的需求：**\n${specReview.missing.map((m: string) => `- ${m}`).join("\n")}`,
+      );
+    if (specReview.extra?.length)
+      issues.push(`**多余的实现：**\n${specReview.extra.map((e: string) => `- ${e}`).join("\n")}`);
+    if (specReview.misunderstandings?.length)
+      issues.push(
+        `**理解偏差：**\n${specReview.misunderstandings.map((m: string) => `- ${m}`).join("\n")}`,
+      );
+    if (specReview.harnessExists === false)
+      issues.push("**缺少 harness 测试**：必须编写自验证测试");
+
+    pi.sendUserMessage(`Spec 一致性审查未通过，请修复后继续：\n\n${issues.join("\n\n")}`, {
       deliverAs: "followUp",
     });
     return;
   }
 
-  // 质量通过 → 生成完成报告
+  // ---- 阶段 2：代码质量审查 ----
+  // 只有 spec 一致性通过后才进行代码质量审查
+  const codeQualityPrompt = await loadPrompt(piDir, "review-code-quality", {
+    taskSpec,
+    gitDiff: gitDiff.stdout || "(no changes)",
+  });
+
+  const qualityResult = await runSubagent(codeQualityPrompt, ctx.cwd, { tools: ["read", "bash"] });
+  const qualityReview = parseJson(qualityResult.output);
+
+  if (qualityReview && qualityReview.approved === false) {
+    // 代码质量不通过 → 回到 in_progress
+    const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
+    await writeTaskFile(piDir, reverted);
+
+    const issueList = (qualityReview.issues || [])
+      .filter((i: { severity: string }) => i.severity === "critical" || i.severity === "important")
+      .map(
+        (i: { severity: string; description: string; file: string }) =>
+          `- [${i.severity}] ${i.description}${i.file ? ` (${i.file})` : ""}`,
+      )
+      .join("\n");
+
+    pi.sendUserMessage(`代码质量审查未通过，请修复后继续：\n\n${issueList}`, {
+      deliverAs: "followUp",
+    });
+    return;
+  }
+
+  // 两阶段都通过 → 生成完成报告
   await handleGenerateReport(pi, piDir, taskFile, task, ctx);
 }
 
