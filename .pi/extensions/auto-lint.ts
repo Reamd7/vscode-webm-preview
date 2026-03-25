@@ -1,11 +1,26 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+function isProjectFile(filePath: string): boolean {
+  // Only lint files under packages/, not .pi/ or other dirs
+  const normalized = filePath.replace(/\\/g, "/");
+  return normalized.includes("packages/");
+}
+
 export default function (pi: ExtensionAPI): void {
   let filesModified = false;
 
   pi.on("tool_call", (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
-      filesModified = true;
+      const input: unknown = event.input;
+      if (
+        typeof input === "object" &&
+        input !== null &&
+        "path" in input &&
+        typeof input.path === "string" &&
+        isProjectFile(input.path)
+      ) {
+        filesModified = true;
+      }
     }
   });
 
