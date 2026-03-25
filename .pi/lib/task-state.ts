@@ -11,6 +11,8 @@ export interface Task {
   title: string;
   status: TaskStatus;
   summary: string | null;
+  /** ID of the task this was split from (for inheriting parent spec context). */
+  splitFromId?: string;
 }
 
 export interface TaskFile {
@@ -91,6 +93,7 @@ export function splitTask(
       title: nt.title,
       status: "pending" as TaskStatus,
       summary: null,
+      splitFromId: targetId,
     };
   });
 

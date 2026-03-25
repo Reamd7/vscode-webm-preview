@@ -199,6 +199,12 @@ async function handleTaskPending(
   const completedSummaries = buildCompletedSummaries(taskFile);
   const taskSpecPath = join(piDir, "task", task.id, "spec.md");
 
+  // If this task was split from a parent, load the parent's spec as context
+  let parentSpec = "";
+  if (task.splitFromId) {
+    parentSpec = await safeReadFile(join(piDir, "task", task.splitFromId, "spec.md"));
+  }
+
   const prompt = await loadPrompt(piDir, "prepare-task", {
     goal: taskFile.goal,
     projectSpec,
@@ -206,6 +212,7 @@ async function handleTaskPending(
     taskTitle: task.title,
     completedSummaries,
     taskSpecPath,
+    parentSpec,
   });
 
   await runSubagent(prompt, ctx.cwd, { tools: ["read", "write", "bash"] });
@@ -271,6 +278,7 @@ async function handleTaskReady(
     "## 要求",
     "- 代码需要通过 lint, typecheck, 测试",
     "- 测试覆盖率 100%",
+    "- **必须编写自验证测试（harness）**：针对本任务 spec 中的验收标准，编写测试用例验证你的实现行为是否符合预期",
     "- 完成后告知我",
   ].join("\n");
 
@@ -467,26 +475,56 @@ async function handleFinalValidation(
   taskFile: TaskFile,
   ctx: ExtensionContext,
 ): Promise<void> {
-  const spec = await safeReadFile(join(piDir, "task", "spec.md"));
+  const projectSpec = await safeReadFile(join(piDir, "task", "spec.md"));
   const completedSummaries = buildCompletedSummaries(taskFile);
+  const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
 
-  const prompt = [
-    "## 最终验收",
-    "",
-    "所有任务已完成。请验证是否满足总目标 spec。",
-    "",
-    "### 总目标 Spec",
-    spec,
-    "",
-    "### 已完成任务摘要",
+  const prompt = await loadPrompt(piDir, "final-validation", {
+    goal: taskFile.goal,
+    projectSpec,
     completedSummaries,
-    "",
-    "### 要求",
-    '如果满足 spec，请告知"验收通过"。',
-    "如果不满足，请说明哪些方面不足，需要补充哪些任务。",
-  ].join("\n");
+    gitStatus: gitStatus.stdout || "(clean)",
+  });
 
-  sendMessage(pi, ctx, prompt);
+  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read", "bash"] });
+  const validation = parseJson(result.output);
+
+  if (validation?.passed === true) {
+    const completed: TaskFile = { ...taskFile, status: "completed" };
+    await writeTaskFile(piDir, completed);
+    sendMessage(pi, ctx, `## 验收通过 ✅\n\n${validation.reason || "所有任务已满足 spec。"}`);
+    return;
+  }
+
+  // Not passed → append new tasks and continue
+  if (validation?.tasks && Array.isArray(validation.tasks) && validation.tasks.length > 0) {
+    const lastDone = [...taskFile.tasks].reverse().find((t) => t.status === "done");
+    const afterId = lastDone?.id ?? taskFile.tasks[taskFile.tasks.length - 1]?.id;
+
+    if (afterId) {
+      const updated = insertTasksAfter(taskFile, afterId, validation.tasks);
+      const firstNew = updated.tasks.find((t) => t.status === "pending");
+      if (firstNew) {
+        await writeTaskFile(piDir, {
+          ...updated,
+          status: "executing",
+          currentTaskId: firstNew.id,
+        });
+        pi.sendUserMessage(
+          `最终验收未通过：${validation.reason || ""}\n已追加 ${validation.tasks.length} 个补充任务，继续执行。`,
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
+    }
+  }
+
+  // Fallback: let main agent handle manually
+  sendMessage(
+    pi,
+    ctx,
+    `## 最终验收未通过\n\n${validation?.reason || "未能确定原因。"}\n\n请手动补充任务或调整 spec。`,
+  );
 }
 
 // ---------------------------------------------------------------------------
