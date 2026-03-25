@@ -66,6 +66,14 @@ export default function taskLoop(pi: ExtensionAPI): void {
    */
   let filesModified = false;
 
+  /**
+   * 追踪当前任务的修复循环次数。
+   * 借鉴 systematic-debugging：超过 2 次修复失败后，
+   * 注入系统化调试指导，阻止 agent 继续盲目尝试。
+   */
+  let fixAttempts = 0;
+  let fixAttemptsTaskId: string | null = null;
+
   // 监听所有 write/edit 工具调用，标记有文件变更
   pi.on("tool_call", (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
@@ -97,10 +105,19 @@ export default function taskLoop(pi: ExtensionAPI): void {
       case "planning":
         await handlePlanning(pi, piDir, taskFile, ctx);
         break;
-      case "executing":
-        await handleExecuting(pi, piDir, taskFile, ctx, filesModified);
-        filesModified = false; // 重置，下个回合重新计数
+      case "executing": {
+        // 追踪修复循环次数：如果 currentTaskId 变了，重置计数
+        const currentId = taskFile.currentTaskId;
+        if (currentId !== fixAttemptsTaskId) {
+          fixAttempts = 0;
+          fixAttemptsTaskId = currentId;
+        }
+        const result = await handleExecuting(pi, piDir, taskFile, ctx, filesModified, fixAttempts);
+        filesModified = false;
+        if (result === "fix_failed") fixAttempts++;
+        else if (result === "fix_passed") fixAttempts = 0;
         break;
+      }
       case "completed":
         // 项目已完成，不做任何事
         break;
@@ -324,8 +341,10 @@ async function handlePlanning(
 /**
  * 执行阶段：根据当前任务的状态分发到对应 handler。
  *
- * 这是最复杂的阶段，包含了任务级别的状态机。
- * 每次 agent_end 都会读取 currentTask 并路由。
+ * 返回值用于追踪修复循环：
+ * - "fix_failed" — 验证失败，回到 in_progress（计数 +1）
+ * - "fix_passed" — 验证通过或状态推进（计数重置）
+ * - undefined — 其他情况（不影响计数）
  */
 async function handleExecuting(
   pi: ExtensionAPI,
@@ -333,37 +352,43 @@ async function handleExecuting(
   taskFile: TaskFile,
   ctx: ExtensionContext,
   filesModified: boolean,
-): Promise<void> {
+  fixAttempts: number,
+): Promise<"fix_failed" | "fix_passed" | undefined> {
   const current = getCurrentTask(taskFile);
 
   if (!current) {
-    // currentTaskId 为 null → 没有 pending 任务了
     if (allTasksDone(taskFile)) {
       await handleFinalValidation(pi, piDir, taskFile, ctx);
     }
     return;
   }
 
-  // 任务级别的状态机 dispatch
   switch (current.status) {
     case "pending":
       await handleTaskPending(pi, piDir, taskFile, current, ctx);
-      break;
+      return "fix_passed";
     case "preparing":
       await handleTaskPreparing(pi, piDir, taskFile, current, ctx);
-      break;
+      return "fix_passed";
     case "ready":
       await handleTaskReady(pi, piDir, taskFile, current, ctx);
-      break;
+      return "fix_passed";
     case "in_progress":
-      await handleTaskInProgress(pi, piDir, taskFile, current, ctx, filesModified);
-      break;
+      return await handleTaskInProgress(
+        pi,
+        piDir,
+        taskFile,
+        current,
+        ctx,
+        filesModified,
+        fixAttempts,
+      );
     case "verifying":
       await handleTaskVerifying(pi, piDir, taskFile, current, ctx);
-      break;
+      return;
     case "done":
       await handleTaskDone(pi, piDir, taskFile, current, ctx);
-      break;
+      return "fix_passed";
   }
 }
 
@@ -555,9 +580,11 @@ async function handleTaskReady(
  * 如果任何一步失败，状态回到 in_progress，注入错误信息让主 agent 修复。
  * 这形成了 in_progress ↔ verifying 的循环，直到两个指标都通过。
  *
- * 为什么检查 filesModified？
- * 因为 agent 可能在一轮中只是回答问题而没有写文件，
- * 这种情况下不应该触发验证。
+ * 借鉴 systematic-debugging：
+ * 当修复循环超过 2 次（fixAttempts >= 2），注入系统化调试指导，
+ * 要求 agent 停止盲目尝试，先做根因调查再提修复方案。
+ *
+ * 返回 "fix_failed" / "fix_passed" 供调用方追踪循环次数。
  */
 async function handleTaskInProgress(
   pi: ExtensionAPI,
@@ -566,7 +593,8 @@ async function handleTaskInProgress(
   task: Task,
   ctx: ExtensionContext,
   filesModified: boolean,
-): Promise<void> {
+  fixAttempts: number,
+): Promise<"fix_failed" | "fix_passed" | undefined> {
   if (!filesModified) return; // 没有文件变更，不触发验证
 
   // 标记为验证中
@@ -576,17 +604,23 @@ async function handleTaskInProgress(
   // ---- 阶段 1：硬编码检查 ----
   const checks = await runHardcodedChecks(pi);
   if (checks.errors.length > 0) {
-    // 失败 → 回到 in_progress，让主 agent 修复
     const reverted = updateTaskStatus(updated, task.id, "in_progress");
     await writeTaskFile(piDir, reverted);
-    pi.sendUserMessage(`硬编码检查未通过，请修复：\n\n${checks.errors.join("\n\n")}`, {
-      deliverAs: "followUp",
-    });
-    return;
+
+    // 超过 2 次修复失败 → 注入系统化调试指导
+    let message = `硬编码检查未通过，请修复：\n\n${checks.errors.join("\n\n")}`;
+    if (fixAttempts >= 2) {
+      const debugGuide = await loadPrompt(piDir, "debug-guide", {});
+      message += `\n\n---\n\n⚠️ 你已经在这个任务的修复循环中失败了 ${fixAttempts + 1} 次。请按以下指导系统化调试：\n\n${debugGuide}`;
+    }
+
+    pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return "fix_failed";
   }
 
-  // ---- 阶段 2：LLM 质量反思 ----
-  await handleQualityReflection(pi, piDir, updated, task, ctx);
+  // ---- 阶段 2：LLM 两阶段评审 ----
+  const passed = await handleQualityReflection(pi, piDir, updated, task, ctx, fixAttempts);
+  return passed ? "fix_passed" : "fix_failed";
 }
 
 /**
@@ -640,11 +674,14 @@ async function handleTaskDone(
  * 借鉴自 superpowers/subagent-driven-development 的核心理念：
  * - 阶段 1（spec compliance）：做了没有？做对没有？有没有多做？harness 在不在？
  * - 阶段 2（code quality）：写得好不好？结构清晰吗？测试质量高吗？
+ *   融入了 testing-anti-patterns 和 defense-in-depth 检查。
  *
  * **必须先通过 spec compliance 才能进入 code quality。**
  *
  * 任何阶段不通过 → 回到 in_progress，让主 agent 修复（循环）。
  * 两阶段都通过 → 进入报告生成。
+ *
+ * 返回 true 表示通过，false 表示需要修复。
  */
 async function handleQualityReflection(
   pi: ExtensionAPI,
@@ -652,7 +689,8 @@ async function handleQualityReflection(
   taskFile: TaskFile,
   task: Task,
   ctx: ExtensionContext,
-): Promise<void> {
+  fixAttempts: number,
+): Promise<boolean> {
   const taskSpec = await safeReadFile(join(piDir, "task", task.id, "spec.md"));
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
   const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
@@ -687,14 +725,20 @@ async function handleQualityReflection(
     if (specReview.harnessExists === false)
       issues.push("**缺少 harness 测试**：必须编写自验证测试");
 
-    pi.sendUserMessage(`Spec 一致性审查未通过，请修复后继续：\n\n${issues.join("\n\n")}`, {
-      deliverAs: "followUp",
-    });
-    return;
+    let message = `Spec 一致性审查未通过，请修复后继续：\n\n${issues.join("\n\n")}`;
+    if (fixAttempts >= 2) {
+      const debugGuide = await loadPrompt(piDir, "debug-guide", {});
+      message += `\n\n---\n\n⚠️ 修复循环第 ${fixAttempts + 1} 次。请系统化调试：\n\n${debugGuide}`;
+    }
+
+    pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return false;
   }
 
   // ---- 阶段 2：代码质量审查 ----
   // 只有 spec 一致性通过后才进行代码质量审查
+  // 融入了 testing-anti-patterns（mock 行为测试、仅测试用方法等）
+  // 和 defense-in-depth（多层验证检查）
   const codeQualityPrompt = await loadPrompt(piDir, "review-code-quality", {
     taskSpec,
     gitDiff: gitDiff.stdout || "(no changes)",
@@ -716,14 +760,19 @@ async function handleQualityReflection(
       )
       .join("\n");
 
-    pi.sendUserMessage(`代码质量审查未通过，请修复后继续：\n\n${issueList}`, {
-      deliverAs: "followUp",
-    });
-    return;
+    let message = `代码质量审查未通过，请修复后继续：\n\n${issueList}`;
+    if (fixAttempts >= 2) {
+      const debugGuide = await loadPrompt(piDir, "debug-guide", {});
+      message += `\n\n---\n\n⚠️ 修复循环第 ${fixAttempts + 1} 次。请系统化调试：\n\n${debugGuide}`;
+    }
+
+    pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return false;
   }
 
   // 两阶段都通过 → 生成完成报告
   await handleGenerateReport(pi, piDir, taskFile, task, ctx);
+  return true;
 }
 
 /**
