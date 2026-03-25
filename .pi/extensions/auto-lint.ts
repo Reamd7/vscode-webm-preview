@@ -1,9 +1,20 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 function isProjectFile(filePath: string): boolean {
   // Only lint files under packages/, not .pi/ or other dirs
   const normalized = filePath.replace(/\\/g, "/");
   return normalized.includes("packages/");
+}
+
+async function taskLoopActive(cwd: string): Promise<boolean> {
+  try {
+    await readFile(join(cwd, ".pi", "task.json"), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -26,6 +37,12 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (!filesModified) {
+      return;
+    }
+
+    // When task-loop is active, it handles its own checks
+    if (await taskLoopActive(ctx.cwd)) {
+      filesModified = false;
       return;
     }
 
