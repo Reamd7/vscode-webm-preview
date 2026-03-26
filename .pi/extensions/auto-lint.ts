@@ -2,10 +2,11 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-function isProjectFile(filePath: string): boolean {
-  // Only lint files under packages/, not .pi/ or other dirs
+function isTypeScriptFile(filePath: string): boolean {
   const normalized = filePath.replace(/\\/g, "/");
-  return normalized.includes("packages/");
+  return (
+    normalized.includes("packages/") && (normalized.endsWith(".ts") || normalized.endsWith(".tsx"))
+  );
 }
 
 async function taskLoopActive(cwd: string): Promise<boolean> {
@@ -18,6 +19,9 @@ async function taskLoopActive(cwd: string): Promise<boolean> {
 }
 
 export default function (pi: ExtensionAPI): void {
+  // subagent 中不需要 auto-lint（subagent 是一次性的审查/生成任务）
+  if (process.env.PI_SUBAGENT) return;
+
   let filesModified = false;
 
   pi.on("tool_call", (event) => {
@@ -26,9 +30,9 @@ export default function (pi: ExtensionAPI): void {
       if (
         typeof input === "object" &&
         input !== null &&
-        "path" in input &&
-        typeof input.path === "string" &&
-        isProjectFile(input.path)
+        "filePath" in input &&
+        typeof input.filePath === "string" &&
+        isTypeScriptFile(input.filePath)
       ) {
         filesModified = true;
       }

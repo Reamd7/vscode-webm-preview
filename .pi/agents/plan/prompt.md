@@ -51,29 +51,15 @@
 - **files**: 涉及的文件路径（创建/修改/测试）
 - **verify**: 如何验证任务完成（运行什么命令、期望什么输出）
 
-## 输出要求
-
-你必须输出一个 JSON 对象（不要用 markdown 代码块包裹），格式如下：
-
-{
-"tasks": [
-{
-"title": "写 add 函数的失败测试",
-"files": ["tests/math.test.ts"],
-"verify": "pnpm test — 应该看到 1 failed"
-},
-{
-"title": "实现 add 函数使测试通过",
-"files": ["src/math.ts", "tests/math.test.ts"],
-"verify": "pnpm test — 应该看到 0 failed"
-}
-]
-}
-
 ## 规则
 
 - 任务是串行的，按执行顺序排列
 - 每个任务应该能在 15 分钟内完成
 - 每个任务应该能在 200k token 上下文中完成
 - DRY、YAGNI、TDD
-- 只输出 JSON，不要其他文本
+
+## 输出要求
+
+完成计划后，你必须调用 `submit_plan` tool 提交结果。不要直接输出 JSON 文本。
+
+调用示例：`submit_plan({ tasks: [{ title: "...", files: ["..."], verify: "..." }] })`

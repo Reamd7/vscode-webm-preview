@@ -3,11 +3,11 @@
  *
  * 核心不变量：
  * **每个异步操作（subagent / 硬编码检查）执行前，必须先写入一个"正在进行"的状态。**
- * **dispatch 遇到"正在进行"状态时，什么都不做（等操作完成后再推进）。**
+ * **dispatch 遇到"正在进行"状态时，原地重跑该操作（中断恢复）。**
  *
  * 这保证了：
- * 1. agent_end 重入时不会重复派发 subagent
- * 2. 中断恢复时可以从"正在进行"状态安全重试
+ * 1. 正常流程中不会重入（因为状态已经推进到下一步）
+ * 2. 中断恢复时可以从"正在进行"状态安全重试（subagent 调用都是幂等的）
  * 3. 不需要内存中的 hash/flag 等 hack 来防循环
  *
  * 状态机总览：
@@ -22,6 +22,7 @@
  */
 
 import { join } from "node:path";
+import { writeFile, mkdir } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   readTaskFile,
@@ -38,14 +39,133 @@ import {
   type TaskFile,
   type Task,
 } from "../lib/task-state.js";
-import { loadPrompt, safeReadFile } from "../lib/prompt-loader.js";
-import { runSubagent } from "../lib/subagent.js";
+import { safeReadFile } from "../lib/prompt-loader.js";
+import { loadPrompt } from "../lib/prompt-loader.js";
+
+// ---- Subagent 模块 ----
+import { reviewSpec } from "../agents/review-spec/index.js";
+import { reviewPlan } from "../agents/review-plan/index.js";
+import { generatePlan } from "../agents/plan/index.js";
+import { reflectSize } from "../agents/reflect-size/index.js";
+import { reviewSpecCompliance } from "../agents/review-spec-compliance/index.js";
+import { reviewCodeQuality } from "../agents/review-code-quality/index.js";
+import { generateReport } from "../agents/generate-report/index.js";
+import { analyzeGap } from "../agents/gap-analysis/index.js";
+import { validateProject } from "../agents/final-validation/index.js";
+import { prepareTask } from "../agents/prepare-task/index.js";
+import type { SubagentEvent } from "../lib/subagent.js";
+
+// ===========================================================================
+// Subagent 进度追踪
+// ===========================================================================
+
+/** ctx.ui.setStatus 使用的固定 key */
+const STATUS_KEY = "subagent";
+
+/**
+ * 创建一个 onEvent 回调，将 subagent 事件映射到 ctx.ui.setStatus。
+ *
+ * 显示格式：`[agentLabel] 正在思考...` / `[agentLabel] > read file.ts` / 等
+ *
+ * @param ctx   - ExtensionContext，用于访问 ctx.ui.setStatus
+ * @param label - 人类可读的 subagent 名称（如 "审查 Spec"、"生成计划"）
+ */
+function createProgressHandler(
+  ctx: ExtensionContext,
+  label: string,
+): (event: SubagentEvent) => void {
+  // 启动时立即显示
+  ctx.ui.setStatus(STATUS_KEY, `⏳ [${label}] 正在启动...`);
+
+  return (event: SubagentEvent) => {
+    switch (event.type) {
+      case "text_delta":
+        // 显示最新文本片段（截断到合理长度）
+        {
+          const snippet = event.text.replace(/\s+/g, " ").trim();
+          if (snippet) {
+            const display = snippet.length > 60 ? `${snippet.slice(0, 57)}...` : snippet;
+            ctx.ui.setStatus(STATUS_KEY, `⏳ [${label}] ${display}`);
+          }
+        }
+        break;
+      case "tool_start":
+        ctx.ui.setStatus(
+          STATUS_KEY,
+          `⏳ [${label}] > ${event.toolName}${formatToolArgs(event.args)}`,
+        );
+        break;
+      case "tool_end":
+        ctx.ui.setStatus(STATUS_KEY, `⏳ [${label}] 正在思考...`);
+        break;
+      case "turn_start":
+        if (event.turnIndex > 0) {
+          ctx.ui.setStatus(STATUS_KEY, `⏳ [${label}] 回合 ${event.turnIndex + 1}...`);
+        }
+        break;
+      case "turn_end":
+        break;
+    }
+  };
+}
+
+/**
+ * 清除 subagent 状态显示。
+ */
+function clearProgress(ctx: ExtensionContext): void {
+  ctx.ui.setStatus(STATUS_KEY, undefined as unknown as string);
+}
+
+/**
+ * 在 subagent 调用期间显示进度，结束后自动清除。
+ *
+ * @param ctx   - ExtensionContext
+ * @param label - 人类可读的 subagent 名称
+ * @param fn    - 接收 onEvent 回调的异步函数（即 subagent 调用）
+ */
+async function withProgress<T>(
+  ctx: ExtensionContext,
+  label: string,
+  fn: (onEvent: (event: SubagentEvent) => void) => Promise<T>,
+): Promise<T> {
+  const handler = createProgressHandler(ctx, label);
+  try {
+    return await fn(handler);
+  } finally {
+    clearProgress(ctx);
+  }
+}
+
+/**
+ * 格式化 tool 参数为简短描述（用于状态行）。
+ */
+function formatToolArgs(args?: Record<string, unknown>): string {
+  if (!args) return "";
+  // read/write: 显示文件路径
+  if (typeof args.filePath === "string") {
+    const path = args.filePath as string;
+    // 只显示最后两级路径
+    const parts = path.replace(/\\/g, "/").split("/");
+    const short = parts.length > 2 ? parts.slice(-2).join("/") : path;
+    return ` ${short}`;
+  }
+  // bash: 显示命令片段
+  if (typeof args.command === "string") {
+    const cmd = (args.command as string).trim();
+    const display = cmd.length > 40 ? `${cmd.slice(0, 37)}...` : cmd;
+    return ` \`${display}\``;
+  }
+  return "";
+}
 
 // ===========================================================================
 // Extension 入口
 // ===========================================================================
 
 export default function taskLoop(pi: ExtensionAPI): void {
+  // subagent 中不需要任务循环逻辑（避免 agent_end 重入、命令注册等）
+  if (process.env.PI_SUBAGENT) return;
+
   /**
    * 追踪当前回合是否有文件变更。
    * 只有 in_progress 状态下有文件变更才会触发 verifying。
@@ -59,6 +179,43 @@ export default function taskLoop(pi: ExtensionAPI): void {
   let fixAttempts = 0;
   let fixAttemptsTaskId: string | null = null;
 
+  // ---- /task-loop 命令：以 prompt 直接启动任务循环 ----
+  pi.registerCommand("task-loop", {
+    description: "Start the task loop with a prompt as the goal",
+    handler: async (args, ctx) => {
+      const prompt = args?.trim();
+      if (!prompt) {
+        ctx.ui.notify("Usage: /task-loop <prompt>", "warning");
+        return;
+      }
+
+      const piDir = join(ctx.cwd, ".pi");
+      const existing = await readTaskFile(piDir);
+      if (existing) {
+        ctx.ui.notify(
+          "Task loop already active (task.json exists). Use /task-loop after removing .pi/task.json to start fresh.",
+          "warning",
+        );
+        return;
+      }
+
+      // 写入 agent-loop.txt（持久化 goal，供中断恢复使用）
+      await mkdir(piDir, { recursive: true });
+      await writeFile(join(piDir, "agent-loop.txt"), prompt, "utf8");
+
+      // 创建 task.json (brainstorming) 并发送 brainstorm prompt
+      const taskFile = createTaskFile(prompt);
+      await writeTaskFile(piDir, taskFile);
+
+      const brainstormPrompt = await loadPrompt(piDir, "brainstorm", {
+        goal: prompt,
+        specPath: join(piDir, "task", "spec.md"),
+      });
+
+      sendMessage(pi, ctx, brainstormPrompt);
+    },
+  });
+
   pi.on("tool_call", (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       filesModified = true;
@@ -69,10 +226,7 @@ export default function taskLoop(pi: ExtensionAPI): void {
     const piDir = join(ctx.cwd, ".pi");
     const taskFile = await readTaskFile(piDir);
 
-    if (!taskFile) {
-      await handleNoTaskFile(pi, piDir, ctx);
-      return;
-    }
+    if (!taskFile) return;
 
     switch (taskFile.status) {
       case "brainstorming":
@@ -80,12 +234,12 @@ export default function taskLoop(pi: ExtensionAPI): void {
         break;
 
       case "reviewing_spec":
-        // subagent 正在审查 spec，什么都不做，等审查完成后推进
+        // 中断恢复：进程在 subagent 审查期间被杀，原地重跑
+        await handleBrainstorming(pi, piDir, taskFile, ctx);
         break;
 
       case "planning":
-        // subagent 正在生成/审查计划，什么都不做
-        // 如果是中断恢复且 tasks 已有，推进到 executing
+        // 中断恢复：如果 tasks 已有，推进到 executing；否则重跑计划生成
         if (taskFile.tasks.length > 0) {
           const updated: TaskFile = {
             ...taskFile,
@@ -94,6 +248,18 @@ export default function taskLoop(pi: ExtensionAPI): void {
           };
           await writeTaskFile(piDir, updated);
           pi.sendUserMessage("进入执行阶段。", { deliverAs: "followUp" });
+        } else {
+          const specPath = join(piDir, "task", "spec.md");
+          const spec = (await safeReadFile(specPath)).trim();
+          if (spec) {
+            await generateAndReviewPlan(pi, piDir, taskFile, spec, ctx);
+          } else {
+            // spec 也不存在 → 回退到 brainstorming
+            await writeTaskFile(piDir, { ...taskFile, status: "brainstorming" });
+            pi.sendUserMessage("计划生成被中断且 spec 缺失，回退到 brainstorming。", {
+              deliverAs: "followUp",
+            });
+          }
         }
         break;
 
@@ -111,7 +277,8 @@ export default function taskLoop(pi: ExtensionAPI): void {
       }
 
       case "validating":
-        // subagent 正在做最终验收，什么都不做
+        // 中断恢复：进程在最终验收 subagent 期间被杀，原地重跑
+        await handleFinalValidation(pi, piDir, taskFile, ctx);
         break;
 
       case "completed":
@@ -123,28 +290,6 @@ export default function taskLoop(pi: ExtensionAPI): void {
 // ===========================================================================
 // 项目级别 handlers
 // ===========================================================================
-
-/**
- * 初始触发：检测 agent-loop.txt → 创建 task.json (brainstorming)。
- */
-async function handleNoTaskFile(
-  pi: ExtensionAPI,
-  piDir: string,
-  ctx: ExtensionContext,
-): Promise<void> {
-  const goal = (await safeReadFile(join(piDir, "agent-loop.txt"))).trim();
-  if (!goal) return;
-
-  const taskFile = createTaskFile(goal);
-  await writeTaskFile(piDir, taskFile);
-
-  const prompt = await loadPrompt(piDir, "brainstorm", {
-    goal,
-    specPath: join(piDir, "task", "spec.md"),
-  });
-
-  sendMessage(pi, ctx, prompt);
-}
 
 /**
  * brainstorming：等待 spec.md → 转 reviewing_spec → 跑审查。
@@ -178,11 +323,9 @@ async function handleBrainstorming(
   // ---- 先写状态，再跑 subagent ----
   await writeTaskFile(piDir, { ...taskFile, status: "reviewing_spec" });
 
-  const reviewPrompt = await loadPrompt(piDir, "review-spec", {
-    specContent: spec,
-  });
-  const reviewResult = await runSubagent(reviewPrompt, ctx.cwd, { tools: ["read"] });
-  const review = parseJson(reviewResult.output);
+  const review = await withProgress(ctx, "审查 Spec", (onEvent) =>
+    reviewSpec(spec, ctx.cwd, onEvent),
+  );
 
   if (
     review &&
@@ -233,14 +376,9 @@ async function generateAndReviewPlan(
 ): Promise<void> {
   const context = buildCompletedSummaries(taskFile);
 
-  const planPrompt = await loadPrompt(piDir, "plan", {
-    goal: taskFile.goal,
-    spec,
-    context,
-  });
-
-  const result = await runSubagent(planPrompt, ctx.cwd, { tools: ["read", "bash"] });
-  const plan = parseJson(result.output);
+  const plan = await withProgress(ctx, "生成计划", (onEvent) =>
+    generatePlan(taskFile.goal, spec, context, ctx.cwd, onEvent),
+  );
 
   if (!plan || !Array.isArray(plan.tasks) || plan.tasks.length === 0) {
     // 生成失败 → 回到 brainstorming 让用户调整
@@ -250,14 +388,9 @@ async function generateAndReviewPlan(
   }
 
   // 审查计划
-  const planReviewPrompt = await loadPrompt(piDir, "review-plan", {
-    goal: taskFile.goal,
-    spec,
-    planJson: JSON.stringify(plan.tasks, null, 2),
-  });
-
-  const planReviewResult = await runSubagent(planReviewPrompt, ctx.cwd, { tools: ["read"] });
-  const planReview = parseJson(planReviewResult.output);
+  const planReview = await withProgress(ctx, "审查计划", (onEvent) =>
+    reviewPlan(taskFile.goal, spec, JSON.stringify(plan.tasks, null, 2), ctx.cwd, onEvent),
+  );
 
   let finalTasks = plan.tasks;
 
@@ -270,19 +403,15 @@ async function generateAndReviewPlan(
     // 审查不通过 → 带反馈重试一次
     const issueList = planReview.issues
       .map(
-        (i: { taskIndex: number; issue: string; suggestion: string }) =>
-          `- 任务 ${i.taskIndex + 1}: ${i.issue}（建议：${i.suggestion}）`,
+        (i: { section: string; issue: string; reason: string }) =>
+          `- ${i.section}: ${i.issue}（${i.reason}）`,
       )
       .join("\n");
 
-    const retryPrompt = await loadPrompt(piDir, "plan", {
-      goal: taskFile.goal,
-      spec,
-      context: `${context}\n\n## 上一版计划的审查意见（请根据意见修改）\n\n${issueList}`,
-    });
-
-    const retryResult = await runSubagent(retryPrompt, ctx.cwd, { tools: ["read", "bash"] });
-    const retryPlan = parseJson(retryResult.output);
+    const retryContext = `${context}\n\n## 上一版计划的审查意见（请根据意见修改）\n\n${issueList}`;
+    const retryPlan = await withProgress(ctx, "重新生成计划", (onEvent) =>
+      generatePlan(taskFile.goal, spec, retryContext, ctx.cwd, onEvent),
+    );
 
     if (retryPlan && Array.isArray(retryPlan.tasks) && retryPlan.tasks.length > 0) {
       finalTasks = retryPlan.tasks;
@@ -349,7 +478,8 @@ async function handleExecuting(
       return;
 
     case "reflecting":
-      // subagent 正在反思规模，noop
+      // 中断恢复：进程在 reflect subagent 期间被杀，原地重跑
+      await recoverReflecting(pi, piDir, taskFile, current, ctx);
       return;
 
     case "ready":
@@ -413,17 +543,21 @@ async function handleTaskPending(
     parentSpec = await safeReadFile(join(piDir, "task", task.splitFromId, "spec.md"));
   }
 
-  const preparePrompt = await loadPrompt(piDir, "prepare-task", {
-    goal: taskFile.goal,
-    projectSpec,
-    taskId: task.id,
-    taskTitle: task.title,
-    completedSummaries,
-    taskSpecPath,
-    parentSpec,
-  });
-
-  await runSubagent(preparePrompt, ctx.cwd, { tools: ["read", "write", "bash"] });
+  await withProgress(ctx, `准备任务 ${task.id}`, (onEvent) =>
+    prepareTask(
+      {
+        goal: taskFile.goal,
+        projectSpec,
+        taskId: task.id,
+        taskTitle: task.title,
+        completedSummaries,
+        taskSpecPath,
+        parentSpec,
+      },
+      ctx.cwd,
+      onEvent,
+    ),
+  );
 
   // ---- 阶段 2：reflecting（反思规模）----
   const reflecting = updateTaskStatus(preparing, task.id, "reflecting");
@@ -458,9 +592,9 @@ async function handleTaskPending(
     return;
   }
 
-  const reflectPrompt = await loadPrompt(piDir, "reflect-size", { taskSpec });
-  const reflectResult = await runSubagent(reflectPrompt, ctx.cwd, { tools: ["read"] });
-  const reflection = parseJson(reflectResult.output);
+  const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
+    reflectSize(taskSpec, ctx.cwd, onEvent),
+  );
 
   if (
     reflection?.feasible === false &&
@@ -503,9 +637,9 @@ async function recoverPreparing(
   const reflecting = updateTaskStatus(taskFile, task.id, "reflecting");
   await writeTaskFile(piDir, reflecting);
 
-  const reflectPrompt = await loadPrompt(piDir, "reflect-size", { taskSpec });
-  const reflectResult = await runSubagent(reflectPrompt, ctx.cwd, { tools: ["read"] });
-  const reflection = parseJson(reflectResult.output);
+  const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
+    reflectSize(taskSpec, ctx.cwd, onEvent),
+  );
 
   if (
     reflection?.feasible === false &&
@@ -519,6 +653,56 @@ async function recoverPreparing(
     });
   } else {
     const updated = updateTaskStatus(reflecting, task.id, "ready");
+    await writeTaskFile(piDir, updated);
+    pi.sendUserMessage(
+      `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
+      { deliverAs: "followUp" },
+    );
+  }
+}
+
+/**
+ * 中断恢复：reflecting 状态下重跑 reflectSize subagent。
+ *
+ * 如果 spec 不存在，回退到 pending 重试（和 handleTaskPending 的失败逻辑一致）。
+ * 如果 spec 存在，直接重跑 reflectSize。
+ */
+async function recoverReflecting(
+  pi: ExtensionAPI,
+  piDir: string,
+  taskFile: TaskFile,
+  task: Task,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const taskSpecPath = join(piDir, "task", task.id, "spec.md");
+  const taskSpec = (await safeReadFile(taskSpecPath)).trim();
+
+  if (!taskSpec) {
+    // spec 不存在 → 回退到 pending 重新走 preparing 流程
+    const reverted = updateTaskStatus(taskFile, task.id, "pending");
+    await writeTaskFile(piDir, reverted);
+    pi.sendUserMessage(`任务 ${task.id} 的 reflecting 被中断且 spec 缺失，回退到 pending 重试。`, {
+      deliverAs: "followUp",
+    });
+    return;
+  }
+
+  const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
+    reflectSize(taskSpec, ctx.cwd, onEvent),
+  );
+
+  if (
+    reflection?.feasible === false &&
+    Array.isArray(reflection.tasks) &&
+    reflection.tasks.length > 0
+  ) {
+    const updated = splitTask(taskFile, task.id, reflection.tasks);
+    await writeTaskFile(piDir, { ...updated, status: "executing" });
+    pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
+      deliverAs: "followUp",
+    });
+  } else {
+    const updated = updateTaskStatus(taskFile, task.id, "ready");
     await writeTaskFile(piDir, updated);
     pi.sendUserMessage(
       `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
@@ -693,14 +877,15 @@ async function handleQualityReflection(
   const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
 
   // ---- 阶段 1：Spec 一致性审查 ----
-  const specCompliancePrompt = await loadPrompt(piDir, "review-spec-compliance", {
-    taskSpec,
-    gitStatus: gitStatus.stdout || "(clean)",
-    gitDiff: gitDiff.stdout || "(no changes)",
-  });
-
-  const specResult = await runSubagent(specCompliancePrompt, ctx.cwd, { tools: ["read", "bash"] });
-  const specReview = parseJson(specResult.output);
+  const specReview = await withProgress(ctx, `Spec 一致性审查 (${task.id})`, (onEvent) =>
+    reviewSpecCompliance(
+      taskSpec,
+      gitStatus.stdout || "(clean)",
+      gitDiff.stdout || "(no changes)",
+      ctx.cwd,
+      onEvent,
+    ),
+  );
 
   if (specReview && specReview.compliant === false) {
     const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
@@ -731,13 +916,9 @@ async function handleQualityReflection(
   }
 
   // ---- 阶段 2：代码质量审查 ----
-  const codeQualityPrompt = await loadPrompt(piDir, "review-code-quality", {
-    taskSpec,
-    gitDiff: gitDiff.stdout || "(no changes)",
-  });
-
-  const qualityResult = await runSubagent(codeQualityPrompt, ctx.cwd, { tools: ["read", "bash"] });
-  const qualityReview = parseJson(qualityResult.output);
+  const qualityReview = await withProgress(ctx, `代码质量审查 (${task.id})`, (onEvent) =>
+    reviewCodeQuality(taskSpec, gitDiff.stdout || "(no changes)", ctx.cwd, onEvent),
+  );
 
   if (qualityReview && qualityReview.approved === false) {
     const reverted = updateTaskStatus(taskFile, task.id, "in_progress");
@@ -786,16 +967,17 @@ async function handleGenerateReport(
   const gitDiff = await pi.exec("git", ["diff"], { timeout: 10_000 });
   const gitLog = await pi.exec("git", ["log", "--oneline", "-10"], { timeout: 10_000 });
 
-  const prompt = await loadPrompt(piDir, "generate-report", {
-    taskSpec,
-    gitStatus: gitStatus.stdout || "(clean)",
-    gitDiff: gitDiff.stdout || "(no changes)",
-    gitLog: gitLog.stdout || "(no commits)",
-    reportPath,
-  });
-
-  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read", "write", "bash"] });
-  const report = parseJson(result.output);
+  const report = await withProgress(ctx, `生成报告 (${task.id})`, (onEvent) =>
+    generateReport(
+      taskSpec,
+      gitStatus.stdout || "(clean)",
+      gitDiff.stdout || "(no changes)",
+      gitLog.stdout || "(no commits)",
+      reportPath,
+      ctx.cwd,
+      onEvent,
+    ),
+  );
   const summary = report?.summary || `任务 ${task.id} 已完成`;
 
   // done + summary + advance — 一次性写入
@@ -836,19 +1018,22 @@ async function handleGapAnalysis(
   const projectSpec = await safeReadFile(join(piDir, "task", "spec.md"));
   const completedSummaries = buildCompletedSummaries(taskFile);
 
-  const prompt = await loadPrompt(piDir, "gap-analysis", {
-    goal: taskFile.goal,
-    projectSpec,
-    completedTaskId: completedTask.id,
-    completedTaskTitle: completedTask.title,
-    completedTaskSummary: completedTask.summary || "",
-    nextTaskId: nextTask.id,
-    nextTaskTitle: nextTask.title,
-    completedSummaries,
-  });
-
-  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read", "bash"] });
-  const gap = parseJson(result.output);
+  const gap = await withProgress(ctx, "间隙分析", (onEvent) =>
+    analyzeGap(
+      {
+        goal: taskFile.goal,
+        projectSpec,
+        completedTaskId: completedTask.id,
+        completedTaskTitle: completedTask.title,
+        completedTaskSummary: completedTask.summary || "",
+        nextTaskId: nextTask.id,
+        nextTaskTitle: nextTask.title,
+        completedSummaries,
+      },
+      ctx.cwd,
+      onEvent,
+    ),
+  );
 
   if (gap?.needsIntermediateTasks && Array.isArray(gap.tasks) && gap.tasks.length > 0) {
     const updated = insertTasksAfter(taskFile, completedTask.id, gap.tasks);
@@ -911,15 +1096,16 @@ async function handleFinalValidation(
   const completedSummaries = buildCompletedSummaries(taskFile);
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
 
-  const prompt = await loadPrompt(piDir, "final-validation", {
-    goal: taskFile.goal,
-    projectSpec,
-    completedSummaries,
-    gitStatus: gitStatus.stdout || "(clean)",
-  });
-
-  const result = await runSubagent(prompt, ctx.cwd, { tools: ["read", "bash"] });
-  const validation = parseJson(result.output);
+  const validation = await withProgress(ctx, "最终验收", (onEvent) =>
+    validateProject(
+      taskFile.goal,
+      projectSpec,
+      completedSummaries,
+      gitStatus.stdout || "(clean)",
+      ctx.cwd,
+      onEvent,
+    ),
+  );
 
   if (validation?.passed === true) {
     // 验收通过
@@ -1027,30 +1213,5 @@ function sendMessage(pi: ExtensionAPI, ctx: ExtensionContext, text: string): voi
     pi.sendUserMessage(text);
   } else {
     pi.sendUserMessage(text, { deliverAs: "followUp" });
-  }
-}
-
-function parseJson(text: string): any {
-  try {
-    return JSON.parse(text.trim());
-  } catch {
-    const match = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-    if (match) {
-      try {
-        return JSON.parse(match[1].trim());
-      } catch {
-        /* fall through */
-      }
-    }
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start !== -1 && end > start) {
-      try {
-        return JSON.parse(text.slice(start, end + 1));
-      } catch {
-        /* fall through */
-      }
-    }
-    return null;
   }
 }

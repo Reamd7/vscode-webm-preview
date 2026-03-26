@@ -52,20 +52,8 @@
 
 ## 输出要求
 
-你必须输出一个 JSON 对象（不要用 markdown 代码块包裹）：
+完成审查后，你必须调用 `submit_code_quality` tool 提交结果。不要直接输出 JSON 文本。
 
-{
-"approved": true/false,
-"strengths": ["做得好的方面"],
-"issues": [
-{ "severity": "critical/important/minor", "description": "具体问题", "file": "文件路径" }
-]
-}
+调用示例：`submit_code_quality({ approved: true/false, strengths: [...], issues: [{ severity: "critical"|"important"|"minor", description, file }] })`
 
-- critical：必须修复才能通过（bug、安全问题、测试反模式）
-- important：应该修复（缺少防御性校验、架构问题）
-- minor：建议改进（命名、风格）
-
-只有存在 critical 或 important 问题时，approved 才为 false。
-
-只输出 JSON，不要其他文本。
+`approved` 仅在存在 `critical` 或 `important` 级别问题时为 `false`。

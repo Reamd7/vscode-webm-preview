@@ -27,21 +27,7 @@
 
 ## 输出要求
 
-你必须输出一个 JSON 对象（不要用 markdown 代码块包裹），格式如下：
+完成审查后，你必须调用 `submit_review` tool 提交结果。不要直接输出 JSON 文本。
 
-如果通过：
-{
-"approved": true,
-"recommendations": ["可选的改进建议"]
-}
-
-如果有问题：
-{
-"approved": false,
-"issues": [
-{ "section": "段落名", "issue": "具体问题", "reason": "为什么重要" }
-],
-"recommendations": ["可选的改进建议"]
-}
-
-只输出 JSON，不要其他文本。
+- 如果通过：`submit_review({ approved: true, recommendations: [...] })`
+- 如果有问题：`submit_review({ approved: false, issues: [{ section, issue, reason }], recommendations: [...] })`

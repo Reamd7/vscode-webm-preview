@@ -12,7 +12,7 @@
  * - 任务 ID 用 3 位数字字符串 "001", "002" ...，方便排序和显示
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { join, dirname } from "node:path";
 
 // --- Types ---
@@ -109,10 +109,19 @@ const TASK_FILE = "task.json";
  * extension 通过返回值判断任务系统是否已激活。
  */
 export async function readTaskFile(piDir: string): Promise<TaskFile | null> {
+  let content: string;
   try {
-    const content = await readFile(join(piDir, TASK_FILE), "utf8");
+    content = await readFile(join(piDir, TASK_FILE), "utf8");
+  } catch (err: unknown) {
+    if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw err;
+  }
+  try {
     return JSON.parse(content) as TaskFile;
   } catch {
+    console.warn(`[task-state] Failed to parse ${join(piDir, TASK_FILE)}, returning null`);
     return null;
   }
 }
@@ -123,8 +132,10 @@ export async function readTaskFile(piDir: string): Promise<TaskFile | null> {
  */
 export async function writeTaskFile(piDir: string, taskFile: TaskFile): Promise<void> {
   const filePath = join(piDir, TASK_FILE);
+  const tmpPath = filePath + ".tmp";
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, JSON.stringify(taskFile, null, 2), "utf8");
+  await writeFile(tmpPath, JSON.stringify(taskFile, null, 2), "utf8");
+  await rename(tmpPath, filePath);
 }
 
 // --- Pure state operations ---
@@ -154,12 +165,6 @@ export function updateTaskSummary(taskFile: TaskFile, taskId: string, summary: s
     ...taskFile,
     tasks: taskFile.tasks.map((t) => (t.id === taskId ? { ...t, summary } : t)),
   };
-}
-
-/** 内部工具：计算下一个可用的任务 ID。 */
-function nextId(tasks: Task[]): string {
-  const max = tasks.reduce((m, t) => Math.max(m, parseInt(t.id, 10)), 0);
-  return String(max + 1).padStart(3, "0");
 }
 
 /**

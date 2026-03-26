@@ -130,6 +130,9 @@ function bashWritesToProtectedPath(command: string): boolean {
 // ===========================================================================
 
 export default function taskGuard(pi: ExtensionAPI): void {
+  // subagent 中不需要访问控制（subagent 的工具白名单已由 runSubagent 控制）
+  if (process.env.PI_SUBAGENT) return;
+
   // ------------------------------------------------------------------
   // 1. 状态感知的访问拦截
   // ------------------------------------------------------------------
@@ -143,10 +146,10 @@ export default function taskGuard(pi: ExtensionAPI): void {
     // ---- read/write/edit 拦截 ----
     if (
       (event.toolName === "read" || event.toolName === "write" || event.toolName === "edit") &&
-      "path" in input &&
-      typeof input.path === "string"
+      "filePath" in input &&
+      typeof input.filePath === "string"
     ) {
-      const pathKind = classifyPath(input.path, cwd);
+      const pathKind = classifyPath(input.filePath, cwd);
       if (pathKind === false) return; // 不受保护
 
       if (event.toolName === "read") {

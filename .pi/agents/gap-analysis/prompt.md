@@ -27,21 +27,7 @@
 
 ## 输出要求
 
-你必须输出一个 JSON 对象（不要用 markdown 代码块包裹），格式如下：
+完成分析后，你必须调用 `submit_gap_analysis` tool 提交结果。不要直接输出 JSON 文本。
 
-如果不需要插入：
-{
-"needsIntermediateTasks": false,
-"reason": "简要说明为什么不需要"
-}
-
-如果需要插入：
-{
-"needsIntermediateTasks": true,
-"reason": "简要说明为什么需要",
-"tasks": [
-{ "title": "中间任务描述" }
-]
-}
-
-只输出 JSON，不要其他文本。
+- 如果不需要中间任务：`submit_gap_analysis({ needsIntermediateTasks: false, reason: "..." })`
+- 如果需要中间任务：`submit_gap_analysis({ needsIntermediateTasks: true, reason: "...", tasks: [{ title: "..." }] })`

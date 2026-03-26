@@ -56,14 +56,6 @@
 
 ## 输出要求
 
-你必须输出一个 JSON 对象（不要用 markdown 代码块包裹）：
+完成审查后，你必须调用 `submit_spec_compliance` tool 提交结果。不要直接输出 JSON 文本。
 
-{
-"compliant": true/false,
-"missing": ["缺失的需求1"],
-"extra": ["多余的实现1"],
-"misunderstandings": ["理解偏差1"],
-"harnessExists": true/false
-}
-
-只输出 JSON，不要其他文本。
+调用示例：`submit_spec_compliance({ compliant: true/false, missing: [...], extra: [...], misunderstandings: [...], harnessExists: true/false })`
