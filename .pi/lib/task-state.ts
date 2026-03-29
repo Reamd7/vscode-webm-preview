@@ -79,6 +79,8 @@ export interface Task {
   splitFromId?: string;
   /** spec 生成连续失败次数（防止无限重试）。 */
   prepareAttempts?: number;
+  /** 验证修复循环的连续失败次数（持久化，进程重启后恢复）。 */
+  fixAttempts?: number;
 }
 
 /**

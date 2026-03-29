@@ -172,13 +172,6 @@ export default function taskLoop(pi: ExtensionAPI): void {
    */
   let filesModified = false;
 
-  /**
-   * 追踪当前任务的修复循环次数。
-   * 超过 2 次修复失败后注入系统化调试指导。
-   */
-  let fixAttempts = 0;
-  let fixAttemptsTaskId: string | null = null;
-
   // ---- /task-loop 命令：以 prompt 直接启动任务循环 ----
   pi.registerCommand("task-loop", {
     description: "Start the task loop with a prompt as the goal",
@@ -264,15 +257,37 @@ export default function taskLoop(pi: ExtensionAPI): void {
         break;
 
       case "executing": {
-        const currentId = taskFile.currentTaskId;
-        if (currentId !== fixAttemptsTaskId) {
-          fixAttempts = 0;
-          fixAttemptsTaskId = currentId;
-        }
-        const result = await handleExecuting(pi, piDir, taskFile, ctx, filesModified, fixAttempts);
+        // 立即捕获并重置 filesModified，避免异步链期间的竞态条件。
+        // 如果 handleExecuting 运行期间有新的 tool_call 写文件，
+        // filesModified 会被重新设为 true，下一轮 agent_end 会正确处理。
+        const hadFilesModified = filesModified;
         filesModified = false;
-        if (result === "fix_failed") fixAttempts++;
-        else if (result === "fix_passed") fixAttempts = 0;
+
+        // fixAttempts 从当前任务的持久化字段读取（进程重启后不丢失）
+        const current = getCurrentTask(taskFile);
+        const fixAttempts = current?.fixAttempts ?? 0;
+
+        const result = await handleExecuting(
+          pi,
+          piDir,
+          taskFile,
+          ctx,
+          hadFilesModified,
+          fixAttempts,
+        );
+        if (result === "fix_failed") {
+          // 持久化递增 fixAttempts
+          if (current) {
+            const updated: TaskFile = {
+              ...taskFile,
+              tasks: taskFile.tasks.map((t) =>
+                t.id === current.id ? { ...t, fixAttempts: fixAttempts + 1 } : t,
+              ),
+            };
+            await writeTaskFile(piDir, updated);
+          }
+        }
+        // fix_passed 不需要重置 — 任务推进时 fixAttempts 自然为 0（新任务没有该字段）
         break;
       }
 
@@ -321,7 +336,10 @@ async function handleBrainstorming(
   if (taskFile._lastReviewedSpecHash === specHash) return;
 
   // ---- 先写状态，再跑 subagent ----
-  await writeTaskFile(piDir, { ...taskFile, status: "reviewing_spec" });
+  // 重要：后续写入都基于 currentState，不是原始 taskFile，
+  // 避免并发写入导致的状态覆盖。
+  const currentState: TaskFile = { ...taskFile, status: "reviewing_spec" };
+  await writeTaskFile(piDir, currentState);
 
   const review = await withProgress(ctx, "审查 Spec", (onEvent) =>
     reviewSpec(spec, ctx.cwd, onEvent),
@@ -335,7 +353,7 @@ async function handleBrainstorming(
   ) {
     // 审查不通过 → 回到 brainstorming，记录已审查的 spec hash 防重复
     await writeTaskFile(piDir, {
-      ...taskFile,
+      ...currentState,
       status: "brainstorming",
       _lastReviewedSpecHash: specHash,
     });
@@ -353,9 +371,10 @@ async function handleBrainstorming(
   }
 
   // ---- spec 审查通过 → planning → 生成计划 ----
-  await writeTaskFile(piDir, { ...taskFile, status: "planning" });
+  const planningState: TaskFile = { ...currentState, status: "planning" };
+  await writeTaskFile(piDir, planningState);
 
-  await generateAndReviewPlan(pi, piDir, taskFile, spec, ctx);
+  await generateAndReviewPlan(pi, piDir, planningState, spec, ctx);
 }
 
 /**
@@ -592,6 +611,24 @@ async function handleTaskPending(
     return;
   }
 
+  await runReflectAndApply(pi, piDir, reflecting, task, taskSpec, taskSpecPath, ctx);
+}
+
+/**
+ * 共享逻辑：运行 reflectSize subagent 并根据结果拆分或标记 ready。
+ *
+ * 被 handleTaskPending、recoverPreparing、recoverReflecting 三处调用。
+ * 前提：调用方已经写入 reflecting 状态。
+ */
+async function runReflectAndApply(
+  pi: ExtensionAPI,
+  piDir: string,
+  taskFile: TaskFile,
+  task: Task,
+  taskSpec: string,
+  taskSpecPath: string,
+  ctx: ExtensionContext,
+): Promise<void> {
   const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
     reflectSize(taskSpec, ctx.cwd, onEvent),
   );
@@ -601,15 +638,13 @@ async function handleTaskPending(
     Array.isArray(reflection.tasks) &&
     reflection.tasks.length > 0
   ) {
-    // 任务太大，拆分
-    const updated = splitTask(reflecting, task.id, reflection.tasks);
+    const updated = splitTask(taskFile, task.id, reflection.tasks);
     await writeTaskFile(piDir, { ...updated, status: "executing" });
     pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
       deliverAs: "followUp",
     });
   } else {
-    // 任务可行 → ready
-    const updated = updateTaskStatus(reflecting, task.id, "ready");
+    const updated = updateTaskStatus(taskFile, task.id, "ready");
     await writeTaskFile(piDir, updated);
     pi.sendUserMessage(
       `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
@@ -637,28 +672,7 @@ async function recoverPreparing(
   const reflecting = updateTaskStatus(taskFile, task.id, "reflecting");
   await writeTaskFile(piDir, reflecting);
 
-  const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
-    reflectSize(taskSpec, ctx.cwd, onEvent),
-  );
-
-  if (
-    reflection?.feasible === false &&
-    Array.isArray(reflection.tasks) &&
-    reflection.tasks.length > 0
-  ) {
-    const updated = splitTask(reflecting, task.id, reflection.tasks);
-    await writeTaskFile(piDir, { ...updated, status: "executing" });
-    pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
-      deliverAs: "followUp",
-    });
-  } else {
-    const updated = updateTaskStatus(reflecting, task.id, "ready");
-    await writeTaskFile(piDir, updated);
-    pi.sendUserMessage(
-      `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
-      { deliverAs: "followUp" },
-    );
-  }
+  await runReflectAndApply(pi, piDir, reflecting, task, taskSpec, taskSpecPath, ctx);
 }
 
 /**
@@ -687,28 +701,7 @@ async function recoverReflecting(
     return;
   }
 
-  const reflection = await withProgress(ctx, `评估任务 ${task.id} 规模`, (onEvent) =>
-    reflectSize(taskSpec, ctx.cwd, onEvent),
-  );
-
-  if (
-    reflection?.feasible === false &&
-    Array.isArray(reflection.tasks) &&
-    reflection.tasks.length > 0
-  ) {
-    const updated = splitTask(taskFile, task.id, reflection.tasks);
-    await writeTaskFile(piDir, { ...updated, status: "executing" });
-    pi.sendUserMessage(`任务 ${task.id} 过大，已拆分为 ${reflection.tasks.length} 个子任务。`, {
-      deliverAs: "followUp",
-    });
-  } else {
-    const updated = updateTaskStatus(taskFile, task.id, "ready");
-    await writeTaskFile(piDir, updated);
-    pi.sendUserMessage(
-      `任务 ${task.id}（${task.title}）已就绪，开始实施。\n\n请阅读任务 spec：${taskSpecPath}`,
-      { deliverAs: "followUp" },
-    );
-  }
+  await runReflectAndApply(pi, piDir, taskFile, task, taskSpec, taskSpecPath, ctx);
 }
 
 /**
@@ -986,8 +979,9 @@ async function handleGenerateReport(
   updated = advanceToNextTask(updated);
   await writeTaskFile(piDir, updated);
 
-  // 间隙分析
-  await handleGapAnalysis(pi, piDir, updated, task, ctx);
+  // 间隙分析 — 使用 updated 中的 task（带 summary），不是原始 task
+  const completedTask = updated.tasks.find((t) => t.id === task.id) ?? task;
+  await handleGapAnalysis(pi, piDir, updated, completedTask, ctx);
 }
 
 // ===========================================================================
@@ -1090,15 +1084,21 @@ async function handleFinalValidation(
   }
 
   // ---- 先写 validating + 递增计数 ----
-  await writeTaskFile(piDir, { ...taskFile, status: "validating", validationAttempts: attempts });
+  // 重要：后续写入都基于 currentState，不是原始 taskFile
+  const currentState: TaskFile = {
+    ...taskFile,
+    status: "validating",
+    validationAttempts: attempts,
+  };
+  await writeTaskFile(piDir, currentState);
 
   const projectSpec = await safeReadFile(join(piDir, "task", "spec.md"));
-  const completedSummaries = buildCompletedSummaries(taskFile);
+  const completedSummaries = buildCompletedSummaries(currentState);
   const gitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
 
   const validation = await withProgress(ctx, "最终验收", (onEvent) =>
     validateProject(
-      taskFile.goal,
+      currentState.goal,
       projectSpec,
       completedSummaries,
       gitStatus.stdout || "(clean)",
@@ -1109,7 +1109,7 @@ async function handleFinalValidation(
 
   if (validation?.passed === true) {
     // 验收通过
-    const completed: TaskFile = { ...taskFile, status: "completed" };
+    const completed: TaskFile = { ...currentState, status: "completed" };
     await writeTaskFile(piDir, completed);
 
     const finishGitStatus = await pi.exec("git", ["status", "--short"], { timeout: 10_000 });
@@ -1129,11 +1129,11 @@ async function handleFinalValidation(
 
   // 验收未通过 → 追加补充任务
   if (validation?.tasks && Array.isArray(validation.tasks) && validation.tasks.length > 0) {
-    const lastDone = [...taskFile.tasks].reverse().find((t) => t.status === "done");
-    const afterId = lastDone?.id ?? taskFile.tasks[taskFile.tasks.length - 1]?.id;
+    const lastDone = [...currentState.tasks].reverse().find((t) => t.status === "done");
+    const afterId = lastDone?.id ?? currentState.tasks[currentState.tasks.length - 1]?.id;
 
     if (afterId) {
-      const updated = insertTasksAfter(taskFile, afterId, validation.tasks);
+      const updated = insertTasksAfter(currentState, afterId, validation.tasks);
       const firstNew = updated.tasks.find((t) => t.status === "pending");
       if (firstNew) {
         await writeTaskFile(piDir, {
@@ -1153,7 +1153,11 @@ async function handleFinalValidation(
 
   // Fallback：subagent 未返回有效的补充任务 → 强制完成，交给用户
   // 不能回到 executing，否则 allTasksDone → 又进 handleFinalValidation → 死循环
-  const completed: TaskFile = { ...taskFile, status: "completed", validationAttempts: attempts };
+  const completed: TaskFile = {
+    ...currentState,
+    status: "completed",
+    validationAttempts: attempts,
+  };
   await writeTaskFile(piDir, completed);
   sendMessage(
     pi,
